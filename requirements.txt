@@ -1,4 +1,3 @@
-flask
-gunicorn
+Flask
 requests
-openai==0.28
+ffmpeg-python

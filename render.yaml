@@ -3,13 +3,7 @@ services:
     name: twilio-webhook-server
     env: python
     plan: free
-    buildCommand: ""
-    startCommand: gunicorn main:app
-    envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: python main.py
