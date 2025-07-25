@@ -1,60 +1,59 @@
 from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse
 import requests
 import os
-import time
 import ffmpeg
+import subprocess
 
 app = Flask(__name__)
 
-TWILIO_AUTH = (os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    response = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
-    <Record maxLength="60" timeout="5" recordingStatusCallback="/recording" />
-</Response>"""
-    return Response(response, mimetype="text/xml")
+    resp = VoiceResponse()
+    resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
+    resp.record(
+        max_length=60,
+        timeout=5,
+        recording_status_callback="/recording",
+        recording_format="wav"
+    )
+    return Response(str(resp), mimetype="application/xml")
 
 @app.route("/recording", methods=["POST"])
 def recording():
     recording_url = request.form.get("RecordingUrl")
-    recording_status = request.form.get("RecordingStatus")
-    print(f"録音URL: {recording_url}")
-    print(f"録音ステータス: {recording_status}")
+    if not recording_url:
+        return "No recording URL", 400
 
-    if recording_status != "completed":
-        print("録音が完了していません。再試行をスキップ。")
-        return Response("Recording not ready", status=200)
+    # 音声ファイル取得
+    audio_url = f"{recording_url}.wav"
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    audio_response = requests.get(audio_url, auth=auth)
+    input_path = "/tmp/input_audio.wav"
+    output_path = "/tmp/converted_audio.mp3"
+    with open(input_path, "wb") as f:
+        f.write(audio_response.content)
 
+    # ffmpegで変換
     try:
-        # Twilio録音ファイルは拡張子なし → .wavでダウンロード
-        audio_url = f"{recording_url}.wav"
-        tmp_input = "/tmp/input_audio.wav"
-        tmp_output = "/tmp/converted_audio.mp3"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "44100", "-ac", "2",
+            output_path
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg変換エラー: {e}")
+        return "Error processing audio", 500
 
-        # ダウンロード（2秒待機して確実にファイルが準備されるように）
-        time.sleep(2)
-        print("音声ファイルをダウンロードします...")
-        audio_data = requests.get(audio_url, auth=TWILIO_AUTH)
-        with open(tmp_input, "wb") as f:
-            f.write(audio_data.content)
-        print(f"音声ファイルを保存しました: {tmp_input}, サイズ: {len(audio_data.content)} バイト")
+    # GeminiやOpenAI APIの呼び出し（仮）
+    print("音声処理完了:", output_path)
 
-        # ffmpegでMP3に変換
-        print("音声をMP3に変換します...")
-        ffmpeg.input(tmp_input).output(tmp_output, ar=44100, ac=2).overwrite_output().run()
-        print(f"MP3変換完了: {tmp_output}")
-
-        # ここでGeminiやAI処理に送る処理を書く
-        print("（AI送信処理はここに追加予定）")
-
-        return Response("録音処理完了", status=200)
-
-    except Exception as e:
-        print(f"録音処理でエラー: {e}")
-        return Response("録音処理失敗", status=500)
+    return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)

@@ -7,3 +7,11 @@ services:
       apt-get update && apt-get install -y ffmpeg
       pip install -r requirements.txt
     startCommand: python main.py
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+
