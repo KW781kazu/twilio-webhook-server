@@ -1,66 +1,66 @@
 from flask import Flask, request, Response
 import requests
 import os
-import openai
 import subprocess
+import time
 
 app = Flask(__name__)
-openai.api_key = os.environ.get("OPENAI_API_KEY")
+
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    print("📞 /voice にアクセスされました", flush=True)
-    response = '''<?xml version="1.0" encoding="UTF-8"?>
+    # TwiML 応答
+    response = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
     <Record 
         maxLength="60" 
-        timeout="5" 
+        timeout="10" 
+        finishOnKey="#" 
+        recordingFormat="wav"
         recordingStatusCallback="/recording" />
-</Response>
-'''
-    return Response(response, mimetype='text/xml')
+</Response>"""
+    return Response(response, mimetype="application/xml")
 
 @app.route("/recording", methods=["POST"])
 def recording():
-    print("🎙 /recording にリクエストが来ました", flush=True)
     recording_url = request.form.get("RecordingUrl")
-    print(f"TwilioからのRecordingUrl: {recording_url}", flush=True)
+    print(f"TwilioからのRecordingUrl: {recording_url}")
 
     if not recording_url:
-        print("❌ RecordingUrlが受け取れていません", flush=True)
-        return Response("NG", status=400)
+        print("録音URLが取得できませんでした")
+        return "No recording URL", 400
 
+    # 1秒待機して録音ファイルが完成するのを待つ
+    time.sleep(1)
+
+    # 録音ファイルを取得
+    audio_response = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+    if audio_response.status_code != 200:
+        print(f"録音ファイル取得失敗: {audio_response.status_code}")
+        return "Failed to fetch audio", 500
+
+    # 一時ファイルに保存
+    input_path = "/tmp/input_audio.wav"
+    output_path = "/tmp/converted_audio.mp3"
+    with open(input_path, "wb") as f:
+        f.write(audio_response.content)
+    print(f"音声ファイルを保存しました: {len(audio_response.content)} バイト")
+
+    # ffmpegでMP3に変換
     try:
-        # Twilioの録音ファイルを取得（拡張子なし＝WAV）
-        audio_response = requests.get(recording_url + ".wav")
-        audio_bytes = audio_response.content
-        print(f"音声ファイルを {len(audio_bytes)} バイト取得しました", flush=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, "-ar", "44100", "-ac", "2", output_path],
+            check=True
+        )
+        print("ffmpegで変換完了")
+    except subprocess.CalledProcessError as e:
+        print(f"ffmpeg変換エラー: {e}")
+        return "Audio processing failed", 500
 
-        # 一時ファイルに保存
-        input_path = "/tmp/input.wav"
-        with open(input_path, "wb") as f:
-            f.write(audio_bytes)
-        print("一時ファイルとして保存しました", flush=True)
-
-        # Whisper API で文字起こし
-        with open(input_path, "rb") as f:
-            response = openai.Audio.transcribe(
-                model="whisper-1",
-                file=f
-            )
-        transcript = response["text"]
-        print(f"文字起こし結果: {transcript}", flush=True)
-
-    except Exception as e:
-        print(f"🔥 エラー発生: {e}", flush=True)
-        return Response("NG", status=500)
-
-    return Response("OK", status=200)
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Twilio Webhook is running", 200
+    return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)
