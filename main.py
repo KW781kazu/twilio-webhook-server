@@ -2,12 +2,18 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
+import io
 from twilio.twiml.voice_response import VoiceResponse
+from google.cloud import speech
 
 app = Flask(__name__)
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# Google Speech-to-Textクライアントの初期化
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
+speech_client = speech.SpeechClient()
 
 @app.route("/voice", methods=['POST'])
 def voice():
@@ -52,6 +58,29 @@ def recording():
     except subprocess.CalledProcessError as e:
         print(f"ffmpeg変換エラー: {e}")
         return Response("Error in processing audio", status=500)
+
+    # Google Speech-to-Textで文字起こし
+    try:
+        with io.open(temp_output, "rb") as audio_file:
+            content = audio_file.read()
+
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+            sample_rate_hertz=44100,
+            language_code="ja-JP"
+        )
+
+        response = speech_client.recognize(config=config, audio=audio)
+        transcript = ""
+        for result in response.results:
+            transcript += result.alternatives[0].transcript
+
+        print(f"文字起こし結果: {transcript}")
+
+    except Exception as e:
+        print(f"Speech-to-Textエラー: {e}")
+        return Response("Error in transcription", status=500)
 
     return Response("OK", status=200)
 
