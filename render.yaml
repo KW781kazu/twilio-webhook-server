@@ -2,11 +2,9 @@ services:
   - type: web
     name: twilio-webhook-server
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn main:app"
     plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
     envVars:
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/credentials.json
