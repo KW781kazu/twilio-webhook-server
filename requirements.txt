@@ -1,3 +1,6 @@
-flask
+Flask
 requests
 twilio
+ffmpeg-python
+google-cloud-speech
+
