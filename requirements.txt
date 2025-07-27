@@ -1,6 +1,4 @@
-
-
-Flask
+Flask==2.3.2
 requests
 twilio
-google-cloud-speech
+gunicorn
