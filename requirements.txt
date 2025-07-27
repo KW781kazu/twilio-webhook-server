@@ -1,5 +1,8 @@
-Flask==2.3.3
+
+Flask==2.3.2
 requests==2.31.0
-twilio==8.11.1
+twilio==8.10.0
 google-cloud-speech==2.21.0
+google-api-core==2.11.0
+gunicorn==21.2.0
 
