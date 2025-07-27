@@ -1,12 +1,17 @@
 from flask import Flask, request, Response
 import requests
 import os
+import subprocess
+import json
+from google.cloud import speech
 from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+GOOGLE_CREDENTIALS_PATH = "/etc/secrets/credentials.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS_PATH
 
 @app.route("/voice", methods=['POST'])
 def voice():
@@ -24,25 +29,51 @@ def voice():
 
 @app.route("/recording", methods=['POST'])
 def recording():
-    """録音完了後の処理（まずはファイル取得だけ確認）"""
-    recording_url = request.form.get('RecordingUrl') + ".wav"
+    """録音完了後の処理"""
+    recording_url = request.form.get('RecordingUrl')
     print(f"TwilioからのRecordingUrl: {recording_url}")
 
-    try:
-        # 音声ファイルをダウンロードして保存
-        audio_content = requests.get(
-            recording_url,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        ).content
-        temp_input = "/tmp/input_audio.wav"
-        with open(temp_input, "wb") as f:
-            f.write(audio_content)
-        print(f"音声ファイルを保存しました: {temp_input}")
-    except Exception as e:
-        print(f"録音ファイル取得エラー: {e}")
-        return Response("Error in recording fetch", status=500)
+    # 音声ファイルをダウンロード
+    audio_content = requests.get(
+        recording_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    ).content
 
-    return Response("OK", status=200)
+    temp_input = "/tmp/input_audio.wav"
+    with open(temp_input, "wb") as f:
+        f.write(audio_content)
+    print(f"音声ファイルを保存しました: {temp_input}")
+
+    # Google Speech-to-Textで文字起こし
+    try:
+        client = speech.SpeechClient()
+        with open(temp_input, "rb") as audio_file:
+            content = audio_file.read()
+
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=8000,
+            language_code="ja-JP"
+        )
+
+        response = client.recognize(config=config, audio=audio)
+        transcript = ""
+        for result in response.results:
+            transcript += result.alternatives[0].transcript
+        print(f"認識結果: {transcript}")
+
+    except Exception as e:
+        print(f"音声認識エラー: {e}")
+        transcript = ""
+
+    # 返信
+    resp = VoiceResponse()
+    if transcript:
+        resp.say(f"ありがとうございました。認識した内容は: {transcript}", language="ja-JP")
+    else:
+        resp.say("すみません、内容を認識できませんでした。", language="ja-JP")
+    return Response(str(resp), mimetype='application/xml')
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
