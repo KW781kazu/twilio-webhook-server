@@ -1,6 +1,4 @@
 Flask
-requests
 twilio
-ffmpeg-python
+requests
 google-cloud-speech
-
