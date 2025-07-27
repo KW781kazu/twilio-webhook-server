@@ -10,10 +10,6 @@ app = Flask(__name__)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-# Google Speech-to-Text
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
-speech_client = speech.SpeechClient()
-
 @app.route("/voice", methods=['POST'])
 def voice():
     """最初の応答: 録音を開始"""
@@ -40,7 +36,7 @@ def recording():
     ).content
 
     temp_input = "/tmp/input_audio.wav"
-    temp_output = "/tmp/converted_audio.flac"  # FLACに変換
+    temp_output = "/tmp/converted_audio.flac"
 
     with open(temp_input, "wb") as f:
         f.write(audio_content)
@@ -58,8 +54,9 @@ def recording():
         print(f"ffmpeg変換エラー: {e}")
         return Response("Error in processing audio", status=500)
 
-    # Google Speech-to-Textで文字起こし
+    # Google Speech-to-Text で文字起こし
     try:
+        client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
             audio_data = audio_file.read()
 
@@ -70,12 +67,13 @@ def recording():
             language_code="ja-JP"
         )
 
-        response = speech_client.recognize(config=config, audio=audio)
+        response = client.recognize(config=config, audio=audio)
+        transcript = ""
         for result in response.results:
-            print(f"音声認識結果: {result.alternatives[0].transcript}")
-
+            transcript += result.alternatives[0].transcript
+        print(f"音声認識結果: {transcript}")
     except Exception as e:
-        print(f"Speech-to-Textエラー: {e}")
+        print(f"音声認識エラー: {e}")
         return Response("Error in speech recognition", status=500)
 
     return Response("OK", status=200)
