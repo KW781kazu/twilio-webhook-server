@@ -7,11 +7,12 @@ from google.cloud import speech
 
 app = Flask(__name__)
 
-# 環境変数
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-GOOGLE_APPLICATION_CREDENTIALS = "/etc/secrets/credentials.json"
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
+
+# Google Speech-to-Text
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
+speech_client = speech.SpeechClient()
 
 @app.route("/voice", methods=['POST'])
 def voice():
@@ -39,17 +40,17 @@ def recording():
     ).content
 
     temp_input = "/tmp/input_audio.wav"
-    temp_output = "/tmp/converted_audio.mp3"
+    temp_output = "/tmp/converted_audio.flac"  # FLACに変換
 
     with open(temp_input, "wb") as f:
         f.write(audio_content)
     print(f"音声ファイルを保存しました: {temp_input}")
 
-    # ffmpegでMP3に変換
+    # ffmpegでFLACに変換
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_input,
-            "-ar", "44100", "-ac", "2",
+            "-ar", "16000", "-ac", "1",
             temp_output
         ], check=True)
         print(f"音声ファイルを変換しました: {temp_output}")
@@ -59,22 +60,23 @@ def recording():
 
     # Google Speech-to-Textで文字起こし
     try:
-        client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
-            audio = speech.RecognitionAudio(content=audio_file.read())
+            audio_data = audio_file.read()
+
+        audio = speech.RecognitionAudio(content=audio_data)
         config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.MP3,
-            sample_rate_hertz=44100,
+            encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
+            sample_rate_hertz=16000,
             language_code="ja-JP"
         )
-        response = client.recognize(config=config, audio=audio)
-        transcript = ""
+
+        response = speech_client.recognize(config=config, audio=audio)
         for result in response.results:
-            transcript += result.alternatives[0].transcript
-        print(f"文字起こし結果: {transcript}")
+            print(f"音声認識結果: {result.alternatives[0].transcript}")
+
     except Exception as e:
         print(f"Speech-to-Textエラー: {e}")
-        return Response("Error in Speech-to-Text", status=500)
+        return Response("Error in speech recognition", status=500)
 
     return Response("OK", status=200)
 

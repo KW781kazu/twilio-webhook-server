@@ -5,10 +5,4 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     plan: free
-    envVars:
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /etc/secrets/credentials.json
-    secretFiles:
-      - path: /etc/secrets/credentials.json
-        contents: $CREDENTIALS_JSON
-
+    autoDeploy: true
