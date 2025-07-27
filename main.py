@@ -7,8 +7,12 @@ from google.cloud import speech
 
 app = Flask(__name__)
 
+# Twilio 認証情報
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# Google 認証ファイル
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
 
 @app.route("/voice", methods=['POST'])
 def voice():
@@ -36,6 +40,10 @@ def recording():
         auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     ).content
 
+    if not audio_content:
+        print("録音ファイルが空です。")
+        return Response("No audio content", status=400)
+
     temp_input = "/tmp/input_audio.wav"
     temp_output = "/tmp/converted_audio.flac"
 
@@ -47,7 +55,7 @@ def recording():
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_input,
-            "-ar", "16000", "-ac", "1",
+            "-ac", "1", "-ar", "16000",
             temp_output
         ], check=True)
         print(f"音声ファイルを変換しました: {temp_output}")
@@ -55,24 +63,22 @@ def recording():
         print(f"ffmpeg変換エラー: {e}")
         return Response("Error in processing audio", status=500)
 
-    # Google Speech-to-Textで文字起こし
+    # Google Speech-to-Text で文字起こし
     try:
         client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
-            content = audio_file.read()
-
-        audio = speech.RecognitionAudio(content=content)
+            audio = speech.RecognitionAudio(content=audio_file.read())
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
             sample_rate_hertz=16000,
             language_code="ja-JP"
         )
         response = client.recognize(config=config, audio=audio)
-        for result in response.results:
-            print(f"認識結果: {result.alternatives[0].transcript}")
+        transcript = "".join([result.alternatives[0].transcript for result in response.results])
+        print(f"文字起こし結果: {transcript}")
     except Exception as e:
-        print(f"音声認識エラー: {e}")
-        return Response("Error in speech recognition", status=500)
+        print(f"Speech-to-Text エラー: {e}")
+        return Response("Error in speech-to-text", status=500)
 
     return Response("OK", status=200)
 
