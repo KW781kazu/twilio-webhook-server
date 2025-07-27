@@ -1,7 +1,5 @@
 
-Flask==2.3.2
-twilio==8.5.0
+Flask==2.2.5
 requests==2.31.0
+twilio==8.5.0
 google-cloud-speech==2.21.0
-setuptools
-
