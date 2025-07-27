@@ -3,8 +3,5 @@ services:
     name: twilio-webhook-server
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: ""
     startCommand: "python main.py"
-    envVars:
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /etc/secrets/credentials.json
