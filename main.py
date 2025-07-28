@@ -2,7 +2,7 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
-import json
+import traceback
 from google.cloud import speech
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -36,10 +36,16 @@ def recording():
     print(f"[INFO] TwilioからのRecordingUrl: {recording_url}")
 
     # 音声ファイルをダウンロード
-    audio_content = requests.get(
-        recording_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    ).content
+    try:
+        audio_content = requests.get(
+            recording_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        ).content
+        print("[INFO] 音声ファイルをダウンロードしました")
+    except Exception as e:
+        print(f"[ERROR] 音声ファイルのダウンロードに失敗: {e}")
+        traceback.print_exc()
+        return Response("Error downloading audio", status=500)
 
     temp_input = "/tmp/input_audio.wav"
     temp_output = "/tmp/converted_audio.flac"
@@ -58,10 +64,13 @@ def recording():
         print(f"[INFO] 音声ファイルを変換しました: {temp_output}")
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] ffmpeg変換エラー: {e}")
+        traceback.print_exc()
         return Response("Error in processing audio", status=500)
 
     # Google Speech-to-Text
+    transcription = ""
     try:
+        print("[INFO] Google Speech-to-Text API呼び出し開始")
         client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
             audio = speech.RecognitionAudio(content=audio_file.read())
@@ -73,15 +82,22 @@ def recording():
         )
 
         response = client.recognize(config=config, audio=audio)
-        transcription = ""
         for result in response.results:
             transcription += result.alternatives[0].transcript
         print(f"[INFO] 文字起こし結果: {transcription}")
     except Exception as e:
         print(f"[ERROR] Google Speech-to-Textエラー: {e}")
-        transcription = ""
+        traceback.print_exc()
+        transcription = "音声を認識できませんでした"
 
-    return Response("OK", status=200)
+    # Twilioに文字起こし結果を返答
+    resp = VoiceResponse()
+    if transcription:
+        resp.say(f"認識結果は: {transcription}", language="ja-JP")
+    else:
+        resp.say("音声を認識できませんでした。", language="ja-JP")
+
+    return Response(str(resp), mimetype='application/xml')
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
