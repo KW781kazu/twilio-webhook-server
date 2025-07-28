@@ -1,6 +1,8 @@
-Flask==2.2.5
+
+Flask==2.3.2
 requests==2.31.0
 twilio==8.5.0
-google-cloud-speech==2.26.0
+google-cloud-speech==2.21.0
 google-api-core==2.11.0
-
+setuptools
+ffmpeg-python==0.2.0
