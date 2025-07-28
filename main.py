@@ -5,13 +5,15 @@ import subprocess
 from twilio.twiml.voice_response import VoiceResponse
 from google.cloud import speech
 
+# Flask 初期化
 app = Flask(__name__)
 
+# Twilio 認証
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-GOOGLE_CREDENTIALS = "/etc/secrets/credentials.json"
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS
+# Google 認証ファイルのパスを強制設定
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
 
 @app.route("/voice", methods=['POST'])
 def voice():
@@ -30,7 +32,9 @@ def voice():
 @app.route("/recording", methods=['POST'])
 def recording():
     """録音完了後の処理"""
-    recording_url = request.form.get('RecordingUrl') + ".wav"  # WAV形式を取得
+    print("録音処理開始 /recording にアクセス")
+
+    recording_url = request.form.get('RecordingUrl') + ".wav"
     print(f"TwilioからのRecordingUrl: {recording_url}")
 
     # 音声ファイルをダウンロード
@@ -40,28 +44,45 @@ def recording():
     ).content
 
     temp_input = "/tmp/input_audio.wav"
+    temp_output = "/tmp/converted_audio.flac"
+
     with open(temp_input, "wb") as f:
         f.write(audio_content)
     print(f"音声ファイルを保存しました: {temp_input}")
 
+    # ffmpegでFLACに変換（Google Speech-to-Text推奨）
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", temp_input,
+            "-ar", "16000", "-ac", "1",
+            temp_output
+        ], check=True)
+        print(f"音声ファイルを変換しました: {temp_output}")
+    except subprocess.CalledProcessError as e:
+        print(f"ffmpeg変換エラー: {e}")
+        return Response("Error in processing audio", status=500)
+
     # Google Speech-to-Textで文字起こし
-    client = speech.SpeechClient()
-    with open(temp_input, "rb") as f:
-        content = f.read()
+    try:
+        client = speech.SpeechClient()
+        with open(temp_output, "rb") as audio_file:
+            audio_data = audio_file.read()
 
-    audio = speech.RecognitionAudio(content=content)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=8000,
-        language_code="ja-JP"
-    )
+        audio = speech.RecognitionAudio(content=audio_data)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
+            sample_rate_hertz=16000,
+            language_code="ja-JP"
+        )
+        response = client.recognize(config=config, audio=audio)
+        print("Speech-to-Text API 呼び出し成功")
 
-    response = client.recognize(config=config, audio=audio)
-    transcript = ""
-    for result in response.results:
-        transcript += result.alternatives[0].transcript
+        for result in response.results:
+            print(f"Transcription result: {result.alternatives[0].transcript}")
 
-    print(f"文字起こし結果: {transcript}")
+    except Exception as e:
+        print(f"Speech-to-Text エラー: {e}")
+        return Response("Error in transcription", status=500)
 
     return Response("OK", status=200)
 
