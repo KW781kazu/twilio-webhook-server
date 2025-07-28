@@ -3,17 +3,11 @@ services:
     name: twilio-webhook-server
     env: python
     plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    autoDeploy: true
     envVars:
-      - key: PORT
-        value: 10000
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/credentials.json
-    secretFiles:
-      - name: credentials.json
-        path: /etc/secrets/credentials.json
 
 

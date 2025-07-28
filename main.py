@@ -2,17 +2,17 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
-from twilio.twiml.voice_response import VoiceResponse
+import json
 from google.cloud import speech
+from twilio.twiml.voice_response import VoiceResponse
 
-# Flask 初期化
 app = Flask(__name__)
 
-# Twilio 認証
+# Twilio認証情報
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-# Google 認証ファイルのパスを強制設定
+# Google API認証情報
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
 
 @app.route("/voice", methods=['POST'])
@@ -31,11 +31,9 @@ def voice():
 
 @app.route("/recording", methods=['POST'])
 def recording():
-    """録音完了後の処理"""
-    print("録音処理開始 /recording にアクセス")
-
+    """録音完了後の処理: 音声を取得して文字起こし"""
     recording_url = request.form.get('RecordingUrl') + ".wav"
-    print(f"TwilioからのRecordingUrl: {recording_url}")
+    print(f"[INFO] TwilioからのRecordingUrl: {recording_url}")
 
     # 音声ファイルをダウンロード
     audio_content = requests.get(
@@ -48,41 +46,40 @@ def recording():
 
     with open(temp_input, "wb") as f:
         f.write(audio_content)
-    print(f"音声ファイルを保存しました: {temp_input}")
+    print(f"[INFO] 音声ファイルを保存しました: {temp_input}")
 
-    # ffmpegでFLACに変換（Google Speech-to-Text推奨）
+    # ffmpegでFLACに変換（16kHzにリサンプリング）
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_input,
             "-ar", "16000", "-ac", "1",
             temp_output
         ], check=True)
-        print(f"音声ファイルを変換しました: {temp_output}")
+        print(f"[INFO] 音声ファイルを変換しました: {temp_output}")
     except subprocess.CalledProcessError as e:
-        print(f"ffmpeg変換エラー: {e}")
+        print(f"[ERROR] ffmpeg変換エラー: {e}")
         return Response("Error in processing audio", status=500)
 
-    # Google Speech-to-Textで文字起こし
+    # Google Speech-to-Text
     try:
         client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
-            audio_data = audio_file.read()
+            audio = speech.RecognitionAudio(content=audio_file.read())
 
-        audio = speech.RecognitionAudio(content=audio_data)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
             sample_rate_hertz=16000,
             language_code="ja-JP"
         )
+
         response = client.recognize(config=config, audio=audio)
-        print("Speech-to-Text API 呼び出し成功")
-
+        transcription = ""
         for result in response.results:
-            print(f"Transcription result: {result.alternatives[0].transcript}")
-
+            transcription += result.alternatives[0].transcript
+        print(f"[INFO] 文字起こし結果: {transcription}")
     except Exception as e:
-        print(f"Speech-to-Text エラー: {e}")
-        return Response("Error in transcription", status=500)
+        print(f"[ERROR] Google Speech-to-Textエラー: {e}")
+        transcription = ""
 
     return Response("OK", status=200)
 
