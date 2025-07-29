@@ -9,17 +9,17 @@ app = Flask(__name__)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
+# 会話状態管理（CallSidごと）
+conversation_state = {}
+
 @app.route("/voice", methods=["POST"])
 def voice():
+    call_sid = request.form.get("CallSid")
+    conversation_state[call_sid] = {"step": 1, "data": {}}
     response = """
     <Response>
-        <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
-        <Record 
-            action="/recording" 
-            method="POST" 
-            maxLength="30" 
-            finishOnKey="*" 
-            playBeep="true" />
+        <Say language="ja-JP">こんにちは。お名前を教えてください。</Say>
+        <Record action="/recording" method="POST" maxLength="30" playBeep="true"/>
     </Response>
     """
     return Response(response, mimetype="application/xml")
@@ -27,21 +27,18 @@ def voice():
 @app.route("/recording", methods=["POST"])
 def process_recording():
     try:
-        recording_url = request.form.get("RecordingUrl")
-        if not recording_url:
-            return Response("<Response><Say>録音URLが取得できませんでした。</Say></Response>", mimetype="application/xml")
+        call_sid = request.form.get("CallSid")
+        state = conversation_state.get(call_sid, {"step": 1, "data": {}})
+        step = state["step"]
 
-        # Twilio録音ファイルを取得
+        recording_url = request.form.get("RecordingUrl")
         audio_response = requests.get(
             f"{recording_url}.wav",
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         )
-        if audio_response.status_code != 200:
-            return Response("<Response><Say>音声の取得に失敗しました。</Say></Response>", mimetype="application/xml")
-
         audio_content = audio_response.content
 
-        # Google Speech-to-Text
+        # 音声認識
         client = speech.SpeechClient()
         audio = speech.RecognitionAudio(content=audio_content)
         config = speech.RecognitionConfig(
@@ -49,17 +46,35 @@ def process_recording():
             language_code="ja-JP"
         )
         response = client.recognize(config=config, audio=audio)
+        transcript = response.results[0].alternatives[0].transcript if response.results else ""
 
-        if response.results:
-            transcript = response.results[0].alternatives[0].transcript
-            reply = f"<Response><Say language='ja-JP'>ありがとうございます。あなたはこう言いました。{transcript}</Say></Response>"
+        # 会話分岐
+        if step == 1:
+            state["data"]["name"] = transcript
+            state["step"] = 2
+            reply = f"""
+            <Response>
+                <Say language="ja-JP">ありがとうございます、{transcript}さん。車種を教えてください。</Say>
+                <Record action="/recording" method="POST" maxLength="30" playBeep="true"/>
+            </Response>
+            """
+        elif step == 2:
+            state["data"]["car"] = transcript
+            state["step"] = 3
+            reply = f"""
+            <Response>
+                <Say language="ja-JP">ありがとうございます。{state['data']['name']}さんの{transcript}ですね。これで受付を完了しました。</Say>
+                <Hangup/>
+            </Response>
+            """
         else:
-            reply = "<Response><Say language='ja-JP'>すみません。音声を認識できませんでした。</Say></Response>"
+            reply = "<Response><Say language='ja-JP'>ありがとうございました。</Say><Hangup/></Response>"
 
+        conversation_state[call_sid] = state
         return Response(reply, mimetype="application/xml")
 
     except Exception as e:
-        error_reply = f"<Response><Say>サーバーエラーが発生しました: {str(e)}</Say></Response>"
+        error_reply = f"<Response><Say>エラーが発生しました: {str(e)}</Say></Response>"
         return Response(error_reply, mimetype="application/xml")
 
 @app.route("/")
