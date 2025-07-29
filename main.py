@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, Response
 import requests
 import os
 from google.cloud import speech
@@ -27,10 +27,9 @@ def voice():
 @app.route("/recording", methods=["POST"])
 def process_recording():
     try:
-        app.logger.info("=== /recording endpoint called ===")
         recording_url = request.form.get("RecordingUrl")
         if not recording_url:
-            return jsonify({"error": "No RecordingUrl"}), 400
+            return Response("<Response><Say>録音URLが取得できませんでした。</Say></Response>", mimetype="application/xml")
 
         # Twilio録音ファイルを取得
         audio_response = requests.get(
@@ -38,13 +37,12 @@ def process_recording():
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         )
         if audio_response.status_code != 200:
-            app.logger.error(f"Failed to download audio: {audio_response.status_code}")
-            return jsonify({"error": "Failed to download audio"}), 500
+            return Response("<Response><Say>音声の取得に失敗しました。</Say></Response>", mimetype="application/xml")
 
         audio_content = audio_response.content
 
         # Google Speech-to-Text
-        client = speech.SpeechClient()  # ← 環境変数のパスをそのまま利用
+        client = speech.SpeechClient()
         audio = speech.RecognitionAudio(content=audio_content)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -52,15 +50,17 @@ def process_recording():
         )
         response = client.recognize(config=config, audio=audio)
 
-        if not response.results:
-            return jsonify({"transcription": ""}), 200
+        if response.results:
+            transcript = response.results[0].alternatives[0].transcript
+            reply = f"<Response><Say language='ja-JP'>ありがとうございます。あなたはこう言いました。{transcript}</Say></Response>"
+        else:
+            reply = "<Response><Say language='ja-JP'>すみません。音声を認識できませんでした。</Say></Response>"
 
-        transcript = response.results[0].alternatives[0].transcript
-        return jsonify({"transcription": transcript}), 200
+        return Response(reply, mimetype="application/xml")
 
     except Exception as e:
-        app.logger.error(f"Error in /recording: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        error_reply = f"<Response><Say>サーバーエラーが発生しました: {str(e)}</Say></Response>"
+        return Response(error_reply, mimetype="application/xml")
 
 @app.route("/")
 def health_check():
