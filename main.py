@@ -14,46 +14,52 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Google API認証情報
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
 
+# RenderのURL（RecordingStatusCallback用にフルパスで使用）
+BASE_URL = "https://twilio-webhook-server-3sq0.onrender.com"
+
 @app.route("/voice", methods=['POST'])
 def voice():
     """最初の応答: 録音を開始"""
     resp = VoiceResponse()
     resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
+    # RecordingStatusCallback をフルURLに修正
     resp.record(
         max_length=60,
         timeout=5,
         play_beep=True,
-        recording_status_callback="/recording",
+        recording_status_callback=f"{BASE_URL}/recording",
         recording_status_callback_event=["completed"]
     )
+    print("[DEBUG] /voice エンドポイントが呼ばれました")
     return Response(str(resp), mimetype='application/xml')
 
 @app.route("/recording", methods=['POST'])
 def recording():
     """録音完了後の処理: 音声を取得して文字起こし"""
-    recording_url = request.form.get('RecordingUrl')
+    print("[DEBUG] /recording エンドポイントに到達")
+    print("[DEBUG] 受け取ったデータ:", request.form.to_dict())
+
+    recording_url = request.form.get('RecordingUrl') + ".wav"
     print(f"[INFO] TwilioからのRecordingUrl: {recording_url}")
 
-    # 録音ファイルをダウンロード
+    # 音声ファイルをダウンロード
     try:
-        response = requests.get(
-            recording_url,  # ".wav"は付けない
+        audio_content = requests.get(
+            recording_url,
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        )
-        response.raise_for_status()
-        audio_content = response.content
-        print(f"[INFO] 録音データサイズ: {len(audio_content)} bytes")
+        ).content
     except Exception as e:
-        print(f"[ERROR] 音声ダウンロード失敗: {e}")
-        return Response("Error downloading recording", status=500)
+        print(f"[ERROR] 音声ファイルのダウンロードエラー: {e}")
+        return Response("Error downloading audio", status=500)
 
     temp_input = "/tmp/input_audio.wav"
     temp_output = "/tmp/converted_audio.flac"
+
     with open(temp_input, "wb") as f:
         f.write(audio_content)
     print(f"[INFO] 音声ファイルを保存しました: {temp_input}")
 
-    # ffmpegでFLACに変換
+    # ffmpegでFLACに変換（16kHzにリサンプリング）
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_input,
@@ -78,6 +84,7 @@ def recording():
         )
 
         response = client.recognize(config=config, audio=audio)
+        print(f"[DEBUG] Google Speech API response: {response}")
         transcription = ""
         for result in response.results:
             transcription += result.alternatives[0].transcript
