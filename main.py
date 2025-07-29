@@ -1,25 +1,16 @@
 from flask import Flask, request, jsonify, Response
 import requests
 import os
-import json
 from google.cloud import speech
 
 app = Flask(__name__)
 
-# --- Google認証の修正 ---
-if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-    creds_path = "/tmp/service-account.json"
-    with open(creds_path, "w") as f:
-        f.write(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-
-# Twilio認証情報（環境変数から読み込み）
+# Twilio認証情報
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    # TwiMLを返して応答＆録音開始
     response = """
     <Response>
         <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
@@ -38,13 +29,10 @@ def process_recording():
     try:
         app.logger.info("=== /recording endpoint called ===")
         recording_url = request.form.get("RecordingUrl")
-        app.logger.info(f"Recording URL: {recording_url}")
         if not recording_url:
-            app.logger.error("No RecordingUrl provided")
             return jsonify({"error": "No RecordingUrl"}), 400
 
-        # Twilioの録音ファイルを取得（認証付き）
-        app.logger.info("Downloading audio from Twilio with auth...")
+        # Twilio録音ファイルを取得
         audio_response = requests.get(
             f"{recording_url}.wav",
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -54,29 +42,20 @@ def process_recording():
             return jsonify({"error": "Failed to download audio"}), 500
 
         audio_content = audio_response.content
-        app.logger.info(f"Downloaded audio size: {len(audio_content)} bytes")
 
         # Google Speech-to-Text
-        app.logger.info("Initializing Google Speech client...")
-        client = speech.SpeechClient()
-
+        client = speech.SpeechClient()  # ← 環境変数のパスをそのまま利用
         audio = speech.RecognitionAudio(content=audio_content)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             language_code="ja-JP"
         )
-
-        app.logger.info("Sending audio to Google Speech-to-Text...")
         response = client.recognize(config=config, audio=audio)
-        app.logger.info(f"Google response: {response}")
 
         if not response.results:
-            app.logger.warning("No transcription results returned")
             return jsonify({"transcription": ""}), 200
 
         transcript = response.results[0].alternatives[0].transcript
-        app.logger.info(f"Transcription: {transcript}")
-
         return jsonify({"transcription": transcript}), 200
 
     except Exception as e:
@@ -87,8 +66,6 @@ def process_recording():
 def health_check():
     return "OK", 200
 
-# --- Render用の起動 ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
