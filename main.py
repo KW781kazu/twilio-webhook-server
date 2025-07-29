@@ -2,19 +2,16 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import io
 from google.cloud import speech
 
 app = Flask(__name__)
 
 # --- Google認証の修正 ---
-# 環境変数にJSON文字列が入っているので、起動時にファイル化する
 if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-    creds_path = "/tmp/service-account.json"  # Renderの一時ディレクトリに書き出し
+    creds_path = "/tmp/service-account.json"
     with open(creds_path, "w") as f:
         f.write(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-# これで speech.SpeechClient() が正常に認証できる
 
 @app.route("/recording", methods=["POST"])
 def process_recording():
@@ -26,7 +23,6 @@ def process_recording():
             app.logger.error("No RecordingUrl provided")
             return jsonify({"error": "No RecordingUrl"}), 400
 
-        # Twilioの録音ファイルを取得
         app.logger.info("Downloading audio from Twilio...")
         audio_response = requests.get(f"{recording_url}.wav")
         if audio_response.status_code != 200:
@@ -36,7 +32,6 @@ def process_recording():
         audio_content = audio_response.content
         app.logger.info(f"Downloaded audio size: {len(audio_content)} bytes")
 
-        # Google Speech-to-Text
         app.logger.info("Initializing Google Speech client...")
         client = speech.SpeechClient()
 
@@ -66,3 +61,8 @@ def process_recording():
 @app.route("/")
 def health_check():
     return "OK", 200
+
+# --- Render用の起動 ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
