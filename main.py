@@ -2,6 +2,8 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
+import json
+import traceback
 from google.cloud import speech
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -20,7 +22,7 @@ def voice():
     resp = VoiceResponse()
     resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
     resp.record(
-        max_length=10,
+        max_length=10,  # 短めに
         timeout=3,
         play_beep=True,
         recording_status_callback="/recording",
@@ -40,7 +42,6 @@ def recording():
             recording_url,
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         ).content
-        print(f"[INFO] 音声ファイルサイズ: {len(audio_content)} bytes")
 
         temp_input = "/tmp/input_audio.wav"
         temp_output = "/tmp/converted_audio.flac"
@@ -74,10 +75,12 @@ def recording():
             transcription += result.alternatives[0].transcript
         print(f"[INFO] 文字起こし結果: {transcription}")
 
-    except Exception as e:
-        print(f"[ERROR] 処理中に例外発生: {e}")
+        return Response("OK", status=200)
 
-    return Response("OK", status=200)
+    except Exception as e:
+        print("[ERROR] Google Speech-to-Textエラー:")
+        traceback.print_exc()
+        return Response("Error in processing audio", status=500)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
