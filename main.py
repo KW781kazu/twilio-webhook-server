@@ -1,41 +1,20 @@
 from flask import Flask, request, Response
 import os
-import json
-from flask_sock import Sock
 
 app = Flask(__name__)
-sock = Sock(app)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    # Media Streamsを開始するTwiMLを返す
-    response = f"""
+    # 通常のTwiML応答だけ返す
+    response = """
     <Response>
-        <Start>
-            <Stream url="wss://{request.host}/media" />
-        </Start>
-        <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
+        <Say language="ja-JP">テストです。通話ができています。</Say>
+        <Pause length="1"/>
+        <Say language="ja-JP">このメッセージが聞こえたら接続は成功です。</Say>
+        <Hangup/>
     </Response>
     """
     return Response(response, mimetype="application/xml")
-
-# WebSocketでTwilio音声を受け取る
-@sock.route('/media')
-def media(ws):
-    while True:
-        message = ws.receive()
-        if message is None:
-            break
-        data = json.loads(message)
-        event = data.get("event")
-        if event == "media":
-            payload = data["media"]["payload"]
-            print(f"Audio payload received: {len(payload)} bytes")
-        elif event == "start":
-            print("Media stream started")
-        elif event == "stop":
-            print("Media stream stopped")
-            break
 
 @app.route("/")
 def health_check():
