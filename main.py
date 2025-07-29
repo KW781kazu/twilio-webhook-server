@@ -13,7 +13,10 @@ if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         f.write(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
 
-# Twilioが最初に呼ぶエンドポイント
+# Twilio認証情報（環境変数から読み込み）
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+
 @app.route("/voice", methods=["POST"])
 def voice():
     # TwiMLを返して応答＆録音開始
@@ -40,8 +43,12 @@ def process_recording():
             app.logger.error("No RecordingUrl provided")
             return jsonify({"error": "No RecordingUrl"}), 400
 
-        app.logger.info("Downloading audio from Twilio...")
-        audio_response = requests.get(f"{recording_url}.wav")
+        # Twilioの録音ファイルを取得（認証付き）
+        app.logger.info("Downloading audio from Twilio with auth...")
+        audio_response = requests.get(
+            f"{recording_url}.wav",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        )
         if audio_response.status_code != 200:
             app.logger.error(f"Failed to download audio: {audio_response.status_code}")
             return jsonify({"error": "Failed to download audio"}), 500
@@ -49,6 +56,7 @@ def process_recording():
         audio_content = audio_response.content
         app.logger.info(f"Downloaded audio size: {len(audio_content)} bytes")
 
+        # Google Speech-to-Text
         app.logger.info("Initializing Google Speech client...")
         client = speech.SpeechClient()
 
@@ -83,3 +91,4 @@ def health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
