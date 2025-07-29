@@ -9,7 +9,7 @@ app = Flask(__name__)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
-# 会話状態管理（CallSidごと）
+# 会話状態管理
 conversation_state = {}
 
 @app.route("/voice", methods=["POST"])
@@ -19,7 +19,7 @@ def voice():
     response = """
     <Response>
         <Say language="ja-JP">こんにちは。お名前を教えてください。</Say>
-        <Record action="/recording" method="POST" maxLength="30" playBeep="true"/>
+        <Record action="/recording" method="POST" maxLength="10" timeout="1" playBeep="false"/>
     </Response>
     """
     return Response(response, mimetype="application/xml")
@@ -38,7 +38,7 @@ def process_recording():
         )
         audio_content = audio_response.content
 
-        # 音声認識
+        # Google Speech-to-Text
         client = speech.SpeechClient()
         audio = speech.RecognitionAudio(content=audio_content)
         config = speech.RecognitionConfig(
@@ -55,7 +55,7 @@ def process_recording():
             reply = f"""
             <Response>
                 <Say language="ja-JP">ありがとうございます、{transcript}さん。車種を教えてください。</Say>
-                <Record action="/recording" method="POST" maxLength="30" playBeep="true"/>
+                <Record action="/recording" method="POST" maxLength="10" timeout="1" playBeep="false"/>
             </Response>
             """
         elif step == 2:
