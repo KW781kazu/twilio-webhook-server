@@ -3,29 +3,31 @@ import os
 import json
 from flask_sock import Sock
 import base64
-import audioop
+from pydub import AudioSegment
 from google.cloud import speech
+from io import BytesIO
+from collections import deque
+from threading import Thread
 
 app = Flask(__name__)
 sock = Sock(app)
 
-# Google Speech-to-Text クライアント
 speech_client = speech.SpeechClient()
+audio_queue = deque()
 
 def get_streaming_config():
     return speech.StreamingRecognitionConfig(
         config=speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000,  # Twilioは8kHz
+            sample_rate_hertz=8000,
             language_code="ja-JP",
         ),
-        interim_results=True,  # 中間結果も取得
+        interim_results=True,
         single_utterance=False
     )
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    # Media Streams を開始
     response = f"""
     <Response>
         <Start>
@@ -37,17 +39,25 @@ def voice():
     """
     return Response(response, mimetype="application/xml")
 
-# WebSocketで音声を受信しGoogle STTに逐次送信
+# μ-law を PCM16 に変換
+def ulaw_to_pcm16(ulaw_bytes):
+    audio = AudioSegment(
+        data=ulaw_bytes,
+        sample_width=1,  # μ-law = 8bit
+        frame_rate=8000,
+        channels=1
+    )
+    pcm_wav = BytesIO()
+    audio.export(pcm_wav, format="wav")
+    return pcm_wav.getvalue()
+
 @sock.route('/media')
 def media(ws):
     print("WebSocket: 接続開始")
 
-    # Google STTとのストリーミング接続を作成
     requests_generator = streaming_request_generator()
     responses = speech_client.streaming_recognize(get_streaming_config(), requests_generator)
 
-    # レスポンス処理を非同期で走らせる
-    from threading import Thread
     def listen_responses():
         try:
             for response in responses:
@@ -70,10 +80,8 @@ def media(ws):
             data = json.loads(message)
             event = data.get("event")
             if event == "media":
-                # μ-law → PCM16 変換
                 payload = base64.b64decode(data["media"]["payload"])
-                pcm_audio = audioop.ulaw2lin(payload, 2)
-                # Google STTに送信
+                pcm_audio = ulaw_to_pcm16(payload)
                 audio_queue.append(pcm_audio)
             elif event == "start":
                 print("WebSocket: Media stream started")
@@ -83,10 +91,6 @@ def media(ws):
         except Exception as e:
             print(f"WebSocket Error: {e}")
     print("WebSocket: 接続終了")
-
-# Google STTへの音声送信用ジェネレーター
-from collections import deque
-audio_queue = deque()
 
 def streaming_request_generator():
     while True:
