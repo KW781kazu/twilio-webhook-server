@@ -2,12 +2,10 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
-import json
 from google.cloud import speech
 from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MBまで受信許可
 
 # Twilio認証情報
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -22,7 +20,7 @@ def voice():
     resp = VoiceResponse()
     resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
     resp.record(
-        max_length=10,  # まずはテスト用に録音10秒
+        max_length=10,
         timeout=3,
         play_beep=True,
         recording_status_callback="/recording",
@@ -36,33 +34,29 @@ def recording():
     recording_url = request.form.get('RecordingUrl') + ".wav"
     print(f"[INFO] TwilioからのRecordingUrl: {recording_url}")
 
-    # 音声ファイルをダウンロード
-    audio_content = requests.get(
-        recording_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    ).content
-
-    temp_input = "/tmp/input_audio.wav"
-    temp_output = "/tmp/converted_audio.flac"
-
-    with open(temp_input, "wb") as f:
-        f.write(audio_content)
-    print(f"[INFO] 音声ファイルを保存しました: {temp_input}")
-
-    # ffmpegでFLACに変換（16kHzにリサンプリング）
     try:
+        # 音声ファイルをダウンロード
+        audio_content = requests.get(
+            recording_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        ).content
+
+        temp_input = "/tmp/input_audio.wav"
+        temp_output = "/tmp/converted_audio.flac"
+
+        with open(temp_input, "wb") as f:
+            f.write(audio_content)
+        print(f"[INFO] 音声ファイルを保存しました: {temp_input}")
+
+        # ffmpegでFLACに変換
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_input,
             "-ar", "16000", "-ac", "1",
             temp_output
         ], check=True)
         print(f"[INFO] 音声ファイルを変換しました: {temp_output}")
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] ffmpeg変換エラー: {e}")
-        return Response("Error in processing audio", status=500)
 
-    # Google Speech-to-Text
-    try:
+        # Google Speech-to-Text
         client = speech.SpeechClient()
         with open(temp_output, "rb") as audio_file:
             audio = speech.RecognitionAudio(content=audio_file.read())
@@ -77,10 +71,11 @@ def recording():
         transcription = ""
         for result in response.results:
             transcription += result.alternatives[0].transcript
+
         print(f"[INFO] 文字起こし結果: {transcription}")
+
     except Exception as e:
-        print(f"[ERROR] Google Speech-to-Textエラー: {e}")
-        transcription = ""
+        print(f"[ERROR] Speech-to-Text処理中にエラー: {e}")
 
     return Response("OK", status=200)
 
