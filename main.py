@@ -4,7 +4,8 @@ import json
 from flask_sock import Sock
 import base64
 from google.cloud import speech
-from google import genai  # Gemini
+from vertexai.preview.generative_models import GenerativeModel
+import vertexai
 from collections import deque
 from threading import Thread
 
@@ -13,9 +14,12 @@ sock = Sock(app)
 
 # Google Speech-to-Text
 speech_client = speech.SpeechClient()
-# Gemini
-gemini_client = genai.Client()
-GEMINI_MODEL = "gemini-1.5-flash"
+
+# Vertex AI + Gemini 設定
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+LOCATION = "us-central1"  # Gemini対応リージョン
+vertexai.init(project=PROJECT_ID, location=LOCATION)
+gemini_model = GenerativeModel("gemini-1.5-flash")
 
 audio_queue = deque()
 latest_transcript = ""  # 最新の認識結果を保持
@@ -113,13 +117,10 @@ def streaming_request_generator():
             chunk = audio_queue.popleft()
             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-# Gemini応答生成
+# Gemini応答生成（Vertex AI）
 def get_gemini_response(text):
     try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=f"次の発話に自然に会話で返答してください：{text}"
-        )
+        response = gemini_model.generate_content(f"次の発話に自然に返答してください：{text}")
         return response.text
     except Exception as e:
         print(f"Gemini API Error: {e}")

@@ -2,7 +2,7 @@ Flask==2.2.5
 requests==2.31.0
 twilio==8.5.0
 google-cloud-speech==2.23.0
-google-genai
+google-cloud-aiplatform
 flask-sock==0.6.0
 gunicorn
 gevent
