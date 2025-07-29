@@ -7,9 +7,6 @@ from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
 
-# Flaskの受信サイズ制限（10MBまで）
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
-
 # Twilio認証情報
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -23,7 +20,7 @@ def voice():
     resp = VoiceResponse()
     resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
     resp.record(
-        max_length=5,  # まずは録音を短くして確認
+        max_length=10,
         timeout=3,
         play_beep=True,
         recording_status_callback="/recording",
@@ -43,6 +40,7 @@ def recording():
             recording_url,
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         ).content
+        print(f"[INFO] 音声ファイルサイズ: {len(audio_content)} bytes")
 
         temp_input = "/tmp/input_audio.wav"
         temp_output = "/tmp/converted_audio.flac"
@@ -77,8 +75,7 @@ def recording():
         print(f"[INFO] 文字起こし結果: {transcription}")
 
     except Exception as e:
-        print(f"[ERROR] 音声処理エラー: {e}")
-        return Response("Error processing audio", status=500)
+        print(f"[ERROR] 処理中に例外発生: {e}")
 
     return Response("OK", status=200)
 
