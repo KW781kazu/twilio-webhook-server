@@ -1,81 +1,41 @@
 from flask import Flask, request, Response
-import requests
 import os
-from google.cloud import speech
+import json
+from flask_sock import Sock
 
 app = Flask(__name__)
-
-# Twilio認証情報
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-
-# 会話状態管理
-conversation_state = {}
+sock = Sock(app)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    call_sid = request.form.get("CallSid")
-    conversation_state[call_sid] = {"step": 1, "data": {}}
-    response = """
+    # Media Streamsを開始するTwiMLを返す
+    response = f"""
     <Response>
-        <Say language="ja-JP">こんにちは。お名前を教えてください。</Say>
-        <Record action="/recording" method="POST" maxLength="10" timeout="1" playBeep="false"/>
+        <Start>
+            <Stream url="wss://{request.host}/media" />
+        </Start>
+        <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
     </Response>
     """
     return Response(response, mimetype="application/xml")
 
-@app.route("/recording", methods=["POST"])
-def process_recording():
-    try:
-        call_sid = request.form.get("CallSid")
-        state = conversation_state.get(call_sid, {"step": 1, "data": {}})
-        step = state["step"]
-
-        recording_url = request.form.get("RecordingUrl")
-        audio_response = requests.get(
-            f"{recording_url}.wav",
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        )
-        audio_content = audio_response.content
-
-        # Google Speech-to-Text
-        client = speech.SpeechClient()
-        audio = speech.RecognitionAudio(content=audio_content)
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            language_code="ja-JP"
-        )
-        response = client.recognize(config=config, audio=audio)
-        transcript = response.results[0].alternatives[0].transcript if response.results else ""
-
-        # 会話分岐
-        if step == 1:
-            state["data"]["name"] = transcript
-            state["step"] = 2
-            reply = f"""
-            <Response>
-                <Say language="ja-JP">ありがとうございます、{transcript}さん。車種を教えてください。</Say>
-                <Record action="/recording" method="POST" maxLength="10" timeout="1" playBeep="false"/>
-            </Response>
-            """
-        elif step == 2:
-            state["data"]["car"] = transcript
-            state["step"] = 3
-            reply = f"""
-            <Response>
-                <Say language="ja-JP">ありがとうございます。{state['data']['name']}さんの{transcript}ですね。これで受付を完了しました。</Say>
-                <Hangup/>
-            </Response>
-            """
-        else:
-            reply = "<Response><Say language='ja-JP'>ありがとうございました。</Say><Hangup/></Response>"
-
-        conversation_state[call_sid] = state
-        return Response(reply, mimetype="application/xml")
-
-    except Exception as e:
-        error_reply = f"<Response><Say>エラーが発生しました: {str(e)}</Say></Response>"
-        return Response(error_reply, mimetype="application/xml")
+# WebSocketでTwilio音声を受け取る
+@sock.route('/media')
+def media(ws):
+    while True:
+        message = ws.receive()
+        if message is None:
+            break
+        data = json.loads(message)
+        event = data.get("event")
+        if event == "media":
+            payload = data["media"]["payload"]
+            print(f"Audio payload received: {len(payload)} bytes")
+        elif event == "start":
+            print("Media stream started")
+        elif event == "stop":
+            print("Media stream stopped")
+            break
 
 @app.route("/")
 def health_check():
