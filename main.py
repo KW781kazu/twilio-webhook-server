@@ -2,10 +2,12 @@ from flask import Flask, request, Response
 import requests
 import os
 import subprocess
+import json
 from google.cloud import speech
 from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MBまで受信許可
 
 # Twilio認証情報
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -14,43 +16,31 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Google API認証情報
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/credentials.json"
 
-# RenderのURL（RecordingStatusCallback用にフルパスで使用）
-BASE_URL = "https://twilio-webhook-server-3sq0.onrender.com"
-
 @app.route("/voice", methods=['POST'])
 def voice():
     """最初の応答: 録音を開始"""
     resp = VoiceResponse()
     resp.say("こんにちは。ご用件をどうぞ。", language="ja-JP")
-    # RecordingStatusCallback をフルURLに修正
     resp.record(
-        max_length=60,
-        timeout=5,
+        max_length=10,  # まずはテスト用に録音10秒
+        timeout=3,
         play_beep=True,
-        recording_status_callback=f"{BASE_URL}/recording",
+        recording_status_callback="/recording",
         recording_status_callback_event=["completed"]
     )
-    print("[DEBUG] /voice エンドポイントが呼ばれました")
     return Response(str(resp), mimetype='application/xml')
 
 @app.route("/recording", methods=['POST'])
 def recording():
     """録音完了後の処理: 音声を取得して文字起こし"""
-    print("[DEBUG] /recording エンドポイントに到達")
-    print("[DEBUG] 受け取ったデータ:", request.form.to_dict())
-
     recording_url = request.form.get('RecordingUrl') + ".wav"
     print(f"[INFO] TwilioからのRecordingUrl: {recording_url}")
 
     # 音声ファイルをダウンロード
-    try:
-        audio_content = requests.get(
-            recording_url,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        ).content
-    except Exception as e:
-        print(f"[ERROR] 音声ファイルのダウンロードエラー: {e}")
-        return Response("Error downloading audio", status=500)
+    audio_content = requests.get(
+        recording_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    ).content
 
     temp_input = "/tmp/input_audio.wav"
     temp_output = "/tmp/converted_audio.flac"
@@ -84,7 +74,6 @@ def recording():
         )
 
         response = client.recognize(config=config, audio=audio)
-        print(f"[DEBUG] Google Speech API response: {response}")
         transcription = ""
         for result in response.results:
             transcription += result.alternatives[0].transcript
