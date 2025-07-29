@@ -3,9 +3,8 @@ import os
 import json
 from flask_sock import Sock
 import base64
-from pydub import AudioSegment
+import subprocess
 from google.cloud import speech
-from io import BytesIO
 from collections import deque
 from threading import Thread
 
@@ -39,17 +38,16 @@ def voice():
     """
     return Response(response, mimetype="application/xml")
 
-# μ-law を PCM16 に変換
+# μ-law を PCM16 に ffmpeg で変換
 def ulaw_to_pcm16(ulaw_bytes):
-    audio = AudioSegment(
-        data=ulaw_bytes,
-        sample_width=1,  # μ-law = 8bit
-        frame_rate=8000,
-        channels=1
+    process = subprocess.Popen(
+        ["ffmpeg", "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
     )
-    pcm_wav = BytesIO()
-    audio.export(pcm_wav, format="wav")
-    return pcm_wav.getvalue()
+    pcm_data, _ = process.communicate(input=ulaw_bytes)
+    return pcm_data
 
 @sock.route('/media')
 def media(ws):
