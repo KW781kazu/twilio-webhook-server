@@ -3,7 +3,6 @@ import os
 import json
 from flask_sock import Sock
 import base64
-import subprocess
 from google.cloud import speech
 from collections import deque
 from threading import Thread
@@ -38,16 +37,22 @@ def voice():
     """
     return Response(response, mimetype="application/xml")
 
-# μ-law を PCM16 に ffmpeg で変換
+# μ-law デコード（Python実装）
+def ulaw_decode(byte):
+    MU = 255
+    BIAS = 132
+    u_val = ~byte & 0xFF
+    t = ((u_val & 0x0F) << 3) + BIAS
+    t <<= (u_val & 0x70) >> 4
+    return -t if (u_val & 0x80) else t - BIAS
+
 def ulaw_to_pcm16(ulaw_bytes):
-    process = subprocess.Popen(
-        ["ffmpeg", "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
-    pcm_data, _ = process.communicate(input=ulaw_bytes)
-    return pcm_data
+    # μ-law 1byte → 16bit PCM (little-endian)
+    pcm16 = bytearray()
+    for b in ulaw_bytes:
+        sample = ulaw_decode(b)
+        pcm16 += sample.to_bytes(2, byteorder='little', signed=True)
+    return bytes(pcm16)
 
 @sock.route('/media')
 def media(ws):
