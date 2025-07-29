@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import requests
 import os
 import json
@@ -12,6 +12,23 @@ if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
     with open(creds_path, "w") as f:
         f.write(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+
+# Twilioが最初に呼ぶエンドポイント
+@app.route("/voice", methods=["POST"])
+def voice():
+    # TwiMLを返して応答＆録音開始
+    response = """
+    <Response>
+        <Say language="ja-JP">こんにちは。ご用件をどうぞ。</Say>
+        <Record 
+            action="/recording" 
+            method="POST" 
+            maxLength="30" 
+            finishOnKey="*" 
+            playBeep="true" />
+    </Response>
+    """
+    return Response(response, mimetype="application/xml")
 
 @app.route("/recording", methods=["POST"])
 def process_recording():
