@@ -117,11 +117,19 @@ def streaming_request_generator():
             chunk = audio_queue.popleft()
             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-# Gemini応答生成（Vertex AI）
+# Gemini応答生成（Vertex AI）+ ログ強化
 def get_gemini_response(text):
     try:
-        response = gemini_model.generate_content(f"次の発話に自然に返答してください：{text}")
-        return response.text
+        print(f"[Gemini呼び出し] 入力: {text}")  # 入力ログ
+        response = gemini_model.generate_content(
+            f"次の発話に自然に返答してください：{text}"
+        )
+        print(f"[Geminiレスポンス] 生データ: {response}")  # レスポンス全体
+        print(f"[Geminiレスポンス] text: {getattr(response, 'text', None)}")  # textフィールド
+        if hasattr(response, 'text') and response.text:
+            return response.text
+        else:
+            return "すみません、応答が空でした。"
     except Exception as e:
         print(f"Gemini API Error: {e}")
         return "すみません、今は応答できません。"
