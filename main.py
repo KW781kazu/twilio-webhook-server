@@ -8,6 +8,7 @@ from vertexai.preview.generative_models import GenerativeModel
 import vertexai
 from collections import deque
 from threading import Thread
+import traceback
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -18,6 +19,7 @@ speech_client = speech.SpeechClient()
 # Vertex AI + Gemini 設定
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = "us-central1"  # Gemini対応リージョン
+print(f"[VertexAI Init] project={PROJECT_ID}, location={LOCATION}")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 gemini_model = GenerativeModel("gemini-1.5-flash")
 
@@ -51,7 +53,7 @@ def voice():
     """
     return Response(response, mimetype="application/xml")
 
-# μ-law デコード（軽量版）
+# μ-law デコード
 def ulaw_decode(byte):
     MU = 255
     BIAS = 132
@@ -117,21 +119,22 @@ def streaming_request_generator():
             chunk = audio_queue.popleft()
             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-# Gemini応答生成（Vertex AI）+ ログ強化
+# Gemini応答生成 + 詳細ログ
 def get_gemini_response(text):
     try:
-        print(f"[Gemini呼び出し] 入力: {text}")  # 入力ログ
+        print(f"[Gemini呼び出し] 入力: {text}")
         response = gemini_model.generate_content(
             f"次の発話に自然に返答してください：{text}"
         )
-        print(f"[Geminiレスポンス] 生データ: {response}")  # レスポンス全体
-        print(f"[Geminiレスポンス] text: {getattr(response, 'text', None)}")  # textフィールド
+        print(f"[Geminiレスポンス] 生データ: {response}")
+        print(f"[Geminiレスポンス] text: {getattr(response, 'text', None)}")
         if hasattr(response, 'text') and response.text:
             return response.text
         else:
             return "すみません、応答が空でした。"
     except Exception as e:
         print(f"Gemini API Error: {e}")
+        traceback.print_exc()
         return "すみません、今は応答できません。"
 
 @app.route("/")
