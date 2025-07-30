@@ -1,11 +1,11 @@
 Flask==2.2.5
+gunicorn==21.2.0
+gevent==23.9.1
+gevent-websocket==0.10.1
 requests==2.31.0
 twilio==8.5.0
 google-cloud-speech==2.23.0
-ffmpeg-python==0.2.0
-gunicorn==23.0.0
-gevent==24.2.1
-
+google-cloud-aiplatform==1.58.0
 
 
 
