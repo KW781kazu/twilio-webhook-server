@@ -1,48 +1,80 @@
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 import os
-import requests
-import json
+from google.cloud import speech
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
 app = Flask(__name__)
 
-# Gemini API設定
-GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")  # Renderの環境変数で設定
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# Google Speech-to-Text クライアント
+speech_client = speech.SpeechClient()
 
-def get_gemini_response(user_text):
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-    }
-    data = {
-        "contents": [{"parts": [{"text": user_text}]}]
-    }
-    print("Sending to Gemini:", data)
-    response = requests.post(GEMINI_URL, headers=headers, data=json.dumps(data))
-    print("Gemini status:", response.status_code)
-    print("Gemini response:", response.text)
-    if response.status_code == 200:
-        result = response.json()
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    else:
-        return "すみません、現在応答できません。"
+# Vertex AI (Gemini) 初期化
+project_id = os.getenv("GCP_PROJECT_ID")
+vertexai.init(project=project_id, location="us-central1")
+gemini_model = GenerativeModel("gemini-1.5-flash")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    user_input = request.form.get("SpeechResult", "")
-    print("User said:", user_input)
+    # Twilioから送られるイベントタイプを確認
+    recording_url = request.form.get("RecordingUrl")
+    transcribed_text = ""
 
-    if user_input:
-        ai_reply = get_gemini_response(user_input)
+    if recording_url:
+        # 録音データがある場合は取得してテキスト化
+        audio_content = fetch_audio(recording_url)
+        transcribed_text = transcribe_audio(audio_content)
+
+        if not transcribed_text:
+            transcribed_text = "音声を認識できませんでした。"
+
+        # Geminiで返答生成
+        response_text = generate_ai_response(transcribed_text)
     else:
-        ai_reply = "こんにちは。AI受付です。ご用件をお話しください。"
+        # 初回応答（録音前）
+        response_text = "こんにちは。AI受付です。ご用件をお話しください。"
 
-    resp = VoiceResponse()
-    with resp.gather(input='speech', language='ja-JP', timeout=5) as gather:
-        gather.say(ai_reply, language="ja-JP", voice="Polly.Mizuki")
+    # Twilioに返答
+    vr = VoiceResponse()
+    if not recording_url:
+        # 録音する設定
+        vr.say(response_text, language="ja-JP", voice="Polly.Mizuki")
+        vr.record(
+            action="/webhook",
+            method="POST",
+            max_length=10,
+            play_beep=True,
+            timeout=5,
+        )
+    else:
+        # 返答だけ
+        vr.say(response_text, language="ja-JP", voice="Polly.Mizuki")
 
-    return Response(str(resp), mimetype="application/xml")
+    return Response(str(vr), mimetype="application/xml")
+
+def fetch_audio(url):
+    """Twilioの録音データを取得"""
+    import requests
+    auth = (os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+    r = requests.get(f"{url}.wav", auth=auth)
+    return r.content
+
+def transcribe_audio(audio_content):
+    """Google Speech-to-Textで文字起こし"""
+    audio = speech.RecognitionAudio(content=audio_content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000,
+        language_code="ja-JP",
+    )
+    response = speech_client.recognize(config=config, audio=audio)
+    return response.results[0].alternatives[0].transcript if response.results else ""
+
+def generate_ai_response(text):
+    """Geminiで自然な返答を生成"""
+    response = gemini_model.generate_content(f"以下の内容に自然な日本語で返答してください：{text}")
+    return response.text.strip()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
