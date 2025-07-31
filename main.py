@@ -6,11 +6,10 @@ app = Flask(__name__)
 @app.route("/webhook", methods=["POST"])
 def webhook():
     resp = VoiceResponse()
-    # 日本語音声 + しばらく待機
+    # 日本語自然音声を指定
     with resp.gather(input='speech', language='ja-JP', timeout=5) as gather:
-        gather.say("こんにちは。AI受付です。ご用件をお話しください。", language="ja-JP")
-    # 何も応答がなければ再度話す
-    resp.say("もしもし。ご用件をお話しください。", language="ja-JP")
+        gather.say("こんにちは。AI受付です。ご用件をお話しください。", language="ja-JP", voice="Polly.Mizuki")
+    resp.say("もしもし。ご用件をお話しください。", language="ja-JP", voice="Polly.Mizuki")
     return Response(str(resp), mimetype="application/xml")
 
 if __name__ == "__main__":
