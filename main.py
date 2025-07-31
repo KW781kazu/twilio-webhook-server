@@ -1,23 +1,19 @@
-from flask import Flask, request, jsonify
-import os
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    return "Server is running", 200
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Twilioからのリクエストを受け取る
-    data = request.form
-    print("Incoming data:", data)
-
-    # 簡単な応答（電話用）
-    response = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>こんにちは。AI受付です。</Say></Response>'
-    return response, 200, {'Content-Type': 'application/xml'}
+    resp = VoiceResponse()
+    # 日本語音声 + しばらく待機
+    with resp.gather(input='speech', language='ja-JP', timeout=5) as gather:
+        gather.say("こんにちは。AI受付です。ご用件をお話しください。", language="ja-JP")
+    # 何も応答がなければ再度話す
+    resp.say("もしもし。ご用件をお話しください。", language="ja-JP")
+    return Response(str(resp), mimetype="application/xml")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
+
 
