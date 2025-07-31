@@ -8,7 +8,7 @@ app = Flask(__name__)
 # Vertex AI 初期化
 aiplatform.init(project=os.environ.get("GCP_PROJECT_ID"), location="us-central1")
 gemini_model = GenerativeModel(
-    "projects/{}/locations/us-central1/publishers/google/models/gemini-1.5-pro".format(
+    "projects/{}/locations/us-central1/publishers/google/models/gemini-1.0-pro".format(
         os.environ.get("GCP_PROJECT_ID")
     )
 )
@@ -16,7 +16,6 @@ gemini_model = GenerativeModel(
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # Twilio からの録音データ取得
         recording_url = request.form.get("RecordingUrl")
         if not recording_url:
             response = """<?xml version="1.0" encoding="UTF-8"?>
@@ -31,7 +30,6 @@ def webhook():
         result = gemini_model.generate_content(prompt)
         ai_response = result.candidates[0].content.parts[0].text if result.candidates else "すみません、内容を理解できませんでした。"
 
-        # TwiML で応答
         response = f"""<?xml version="1.0" encoding="UTF-8"?>
             <Response>
                 <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
