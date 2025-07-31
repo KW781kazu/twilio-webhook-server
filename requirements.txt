@@ -1,7 +1,9 @@
 twilio==8.5.0
 google-cloud-speech==2.25.1
 google-cloud-storage==2.14.0
-google-cloud-aiplatform==1.70.0   # 追加：Vertex AI SDK
+google-cloud-aiplatform==1.70.0
+gunicorn==21.2.0
+
 
 
 
