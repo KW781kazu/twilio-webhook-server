@@ -1,61 +1,47 @@
 from flask import Flask, request, Response
-from google.cloud.aiplatform.gapic import PredictionServiceClient
+from google.cloud import aiplatform
 import os
-import traceback
 
 app = Flask(__name__)
 
-# 環境変数
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+# プロジェクト情報
+PROJECT_ID = "cloudrun-demo-20250701"  # あなたのプロジェクトIDに置き換え
 LOCATION = "us-central1"
-MODEL_NAME = "text-bison@001"  # 修正: 正しいモデル名
+MODEL_NAME = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/text-bison@002"
 
-# Prediction クライアント
-client = PredictionServiceClient()
-endpoint = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_NAME}"
+# Vertex AI 初期化
+aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
+# Webhookエンドポイント
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        print("=== Webhook called ===")
-        print("Request form data:", request.form)
+        # Twilio から録音データのテキスト（仮に user_input として受け取る）
+        user_input = "こんにちは。お名前を教えてください。"  # ここはSTT処理で置き換え予定
 
-        # Twilioの音声認識結果
-        user_input = request.form.get("SpeechResult", "")
-        print("User input:", user_input)
-
-        if not user_input:
-            user_input = "何も聞き取れませんでした。"
-
-        # Vertex AI にテキストを送信
-        instance = {"content": user_input}
-        parameters = {"temperature": 0.2, "maxOutputTokens": 256}
+        # Vertex AI モデル呼び出し
+        client = aiplatform.gapic.PredictionServiceClient()
+        endpoint = MODEL_NAME
+        instances = [{"prompt": user_input}]
 
         response = client.predict(
             endpoint=endpoint,
-            instances=[instance],
-            parameters=parameters
+            instances=instances
         )
-        print("Vertex AI response:", response)
 
-        ai_response = response.predictions[0].get('content', "すみません、応答できませんでした。")
+        ai_response = response.predictions[0].get("content", "すみません、うまく応答できませんでした。")
 
-        # Twilio応答
+        # Twilio 用レスポンス
         twiml_response = f"""
-        <?xml version="1.0" encoding="UTF-8"?>
         <Response>
             <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
-            <Pause length="1"/>
-            <Say language="ja-JP" voice="Polly.Mizuki">ご用件をお話しください。</Say>
         </Response>
         """
         return Response(twiml_response, mimetype="text/xml")
 
     except Exception as e:
-        print("Error occurred:", e)
-        traceback.print_exc()
+        print(f"Error: {e}")
         error_response = """
-        <?xml version="1.0" encoding="UTF-8"?>
         <Response>
             <Say language="ja-JP" voice="Polly.Mizuki">現在お答えできません。後ほどおかけ直しください。</Say>
         </Response>
@@ -64,7 +50,7 @@ def webhook():
 
 @app.route("/")
 def index():
-    return "Twilio Webhook Server Running", 200
+    return "Twilio Webhook Server is running!"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
