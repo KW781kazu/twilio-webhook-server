@@ -8,7 +8,7 @@ app = Flask(__name__)
 # 環境変数
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = "us-central1"
-MODEL_NAME = "text-bison@latest"  # 修正：@latest を指定
+MODEL_NAME = "text-bison@latest"  # 修正：@latest を正しく記載
 
 # Prediction クライアント
 client = PredictionServiceClient()
