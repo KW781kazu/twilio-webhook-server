@@ -5,19 +5,17 @@ import os
 app = Flask(__name__)
 
 # プロジェクト情報
-PROJECT_ID = "cloudrun-demo-20250701"  # あなたのプロジェクトIDに置き換え
+PROJECT_ID = "cloudrun-demo-20250701"  # あなたのプロジェクトID
 LOCATION = "us-central1"
 MODEL_NAME = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/text-bison@002"
 
 # Vertex AI 初期化
 aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
-# Webhookエンドポイント
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # Twilio から録音データのテキスト（仮に user_input として受け取る）
-        user_input = "こんにちは。お名前を教えてください。"  # ここはSTT処理で置き換え予定
+        user_input = "こんにちは。お名前を教えてください。"  # 後でSTTに置き換える
 
         # Vertex AI モデル呼び出し
         client = aiplatform.gapic.PredictionServiceClient()
@@ -31,7 +29,7 @@ def webhook():
 
         ai_response = response.predictions[0].get("content", "すみません、うまく応答できませんでした。")
 
-        # Twilio 用レスポンス
+        # Twilio用レスポンス
         twiml_response = f"""
         <Response>
             <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
