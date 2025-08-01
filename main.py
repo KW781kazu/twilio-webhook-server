@@ -3,13 +3,14 @@ from google.cloud import aiplatform
 from google.cloud.aiplatform.gapic import PredictionServiceClient
 from google.cloud.aiplatform.gapic.schema import predict
 import os
+import traceback
 
 app = Flask(__name__)
 
 # 環境変数
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = "us-central1"  # プロジェクトのリージョン
-MODEL_NAME = "text-bison@001"  # まずは Text-Bison
+MODEL_NAME = "text-bison@001"
 
 # Prediction クライアント
 client = PredictionServiceClient()
@@ -18,12 +19,18 @@ endpoint = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # Twilio からの音声入力（テキスト化される前提）
-        user_input = request.form.get("SpeechResult", "何も聞き取れませんでした。")
+        print("=== Webhook called ===")
+        print("Request form data:", request.form)
+
+        # Twilioからの音声入力（SpeechResultが無い場合もログ）
+        user_input = request.form.get("SpeechResult", "")
+        print("User input:", user_input)
+
+        if not user_input:
+            user_input = "何も聞き取れませんでした。"
 
         # Vertex AI にリクエスト
         instance = predict.instance.TextPromptInstance(prompt=user_input)
-        instances = [instance]
         parameters = predict.params.TextGenerationParams(
             temperature=0.2,
             max_output_tokens=256,
@@ -33,10 +40,11 @@ def webhook():
             instances=[instance.to_value()],
             parameters=parameters
         )
+        print("Vertex AI response:", response)
 
         ai_response = response.predictions[0]['content'] if response.predictions else "すみません、応答できませんでした。"
 
-        # Twilio に返す音声応答
+        # Twilioに返す
         twiml_response = f"""
         <?xml version="1.0" encoding="UTF-8"?>
         <Response>
@@ -48,7 +56,8 @@ def webhook():
         return Response(twiml_response, mimetype="text/xml")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print("Error occurred:", e)
+        traceback.print_exc()
         error_response = """
         <?xml version="1.0" encoding="UTF-8"?>
         <Response>
