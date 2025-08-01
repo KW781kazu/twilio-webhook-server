@@ -1,43 +1,56 @@
 from flask import Flask, request, Response
+import google.auth
 from google.cloud import aiplatform
+from google.cloud.aiplatform.gapic import PredictionServiceClient
+from google.cloud.aiplatform.gapic.schema.predict.instance import TextClassificationPredictionInstance
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
 import os
 
 app = Flask(__name__)
 
-# 環境変数からプロジェクトとリージョンを取得
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "cloudrun-demo-20250701")
-LOCATION = os.getenv("GCP_REGION", "us-central1")
-MODEL_NAME = "gemini-1.0-pro"  # 基本モデルで動作確認
+# 環境変数からプロジェクト情報を取得
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+LOCATION = "us-central1"  # Text-Bisonが利用可能なリージョン
+MODEL_NAME = "text-bison"  # Text-Bisonを指定
 
-# Vertex AI 初期化
-aiplatform.init(project=PROJECT_ID, location=LOCATION)
+# Vertex AI クライアント設定
+client_options = {"api_endpoint": f"{LOCATION}-aiplatform.googleapis.com"}
+prediction_client = PredictionServiceClient(client_options=client_options)
+model_path = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_NAME}"
+
+def get_bison_response(text):
+    instance = json_format.ParseDict({"content": text}, Value())
+    response = prediction_client.predict(
+        endpoint=model_path,
+        instances=[instance],
+        parameters=json_format.ParseDict({}, Value())
+    )
+    if response.predictions:
+        return dict(response.predictions[0])["content"]
+    else:
+        return "すみません、うまく応答できませんでした。"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Twilioからの音声→テキストを受け取り、Vertex AIで応答生成"""
-    try:
-        user_input = request.form.get("SpeechResult", "")
-        if not user_input:
-            return twiml_response("音声が認識できませんでした。もう一度お話しください。")
+    # Twilioからのリクエストを取得
+    incoming_data = request.form
+    speech_result = incoming_data.get("SpeechResult", "")
 
-        # Vertex AI GenerativeModel を使用
-        model = aiplatform.GenerativeModel(MODEL_NAME)
-        response = model.generate_content([f"次の内容に自然な日本語で返答してください: {user_input}"])
-        reply_text = response.text if response and hasattr(response, "text") else "現在お答えできません。"
+    # AI応答を取得
+    ai_response = get_bison_response(f"次の内容に日本語で返答してください: {speech_result}")
 
-        return twiml_response(reply_text)
-    except Exception as e:
-        print(f"Error: {e}")
-        return twiml_response("現在お答えできません。後ほどおかけ直しください。")
-
-def twiml_response(text: str):
-    """Twilioに返すXMLレスポンス"""
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # Twilioに返答
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="ja-JP" voice="Polly.Mizuki">{text}</Say>
+    <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
     <Gather input="speech" language="ja-JP" timeout="5" />
 </Response>"""
-    return Response(twiml, mimetype="text/xml")
+    return Response(twiml_response, mimetype="text/xml")
+
+@app.route("/", methods=["GET"])
+def index():
+    return "OK", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
