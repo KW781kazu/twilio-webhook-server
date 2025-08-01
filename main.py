@@ -1,56 +1,54 @@
 from flask import Flask, request, Response
 import os
 from google.cloud import aiplatform
-from google.cloud.aiplatform.gapic import PredictionServiceClient
 
 app = Flask(__name__)
 
+# プロジェクトとリージョンを環境変数から取得
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-LOCATION = "us-central1"
-MODEL_NAME = "text-bison"  # 一旦無料で確実なモデルに
+LOCATION = "us-central1"  # リージョンを明示的に設定
 
+# Vertex AI 初期化
 aiplatform.init(project=PROJECT_ID, location=LOCATION)
+
+# モデル名（最低限動作確認のため text-bison に変更）
+MODEL_NAME = "text-bison"
+
+# モデルを取得
+model = aiplatform.TextGenerationModel.from_pretrained(MODEL_NAME)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        transcribed_text = "ユーザーが話した内容"
+        data = request.form
+        transcription = data.get("SpeechResult", "")
+        print(f"Received transcription: {transcription}")
 
-        client = PredictionServiceClient()
-        endpoint = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_NAME}"
-        response = client.predict(
-            endpoint=endpoint,
-            instances=[{"content": transcribed_text}],
-            parameters={"temperature": 0.2}
+        # Gemini呼び出し（ここでは bison で応答を確認）
+        response = model.predict(
+            prompt=f"ユーザーの発話: {transcription}\n自然な日本語で返答してください。",
+            temperature=0.2,
+            max_output_tokens=256,
         )
 
-        ai_response = response.predictions[0].get("content", "すみません、うまく処理できませんでした。")
-        print(f"AI response: {ai_response}")
+        reply_text = response.text.strip()
+        print(f"Model response: {reply_text}")
 
-        twiml = f"""
-        <Response>
-            <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
-        </Response>
+        twiml_response = f"""
+            <Response>
+                <Say language="ja-JP" voice="Polly.Mizuki">{reply_text}</Say>
+            </Response>
         """
-        return Response(twiml, mimetype="text/xml")
+        return Response(twiml_response, mimetype="text/xml")
 
     except Exception as e:
-        import traceback
-        print("=== ERROR OCCURRED ===")
-        print(e)
-        traceback.print_exc()
-
-        error_twiml = """
-        <Response>
-            <Say language="ja-JP" voice="Polly.Mizuki">現在お答えできません。後ほどおかけ直しください。</Say>
-        </Response>
+        print(f"Error: {e}")
+        error_response = """
+            <Response>
+                <Say language="ja-JP" voice="Polly.Mizuki">現在お答えできません。後ほどおかけ直しください。</Say>
+            </Response>
         """
-        return Response(error_twiml, mimetype="text/xml")
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Webhook is running."
+        return Response(error_response, mimetype="text/xml")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
