@@ -1,7 +1,6 @@
 from flask import Flask, request, Response
 from google.cloud import aiplatform
 from google.cloud.aiplatform.gapic import PredictionServiceClient
-from google.cloud.aiplatform.gapic.schema import predict
 import os
 import traceback
 
@@ -9,7 +8,7 @@ app = Flask(__name__)
 
 # 環境変数
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-LOCATION = "us-central1"  # プロジェクトのリージョン
+LOCATION = "us-central1"
 MODEL_NAME = "text-bison@001"
 
 # Prediction クライアント
@@ -22,29 +21,27 @@ def webhook():
         print("=== Webhook called ===")
         print("Request form data:", request.form)
 
-        # Twilioからの音声入力（SpeechResultが無い場合もログ）
+        # Twilioの音声認識結果
         user_input = request.form.get("SpeechResult", "")
         print("User input:", user_input)
 
         if not user_input:
             user_input = "何も聞き取れませんでした。"
 
-        # Vertex AI にリクエスト
-        instance = predict.instance.TextPromptInstance(prompt=user_input)
-        parameters = predict.params.TextGenerationParams(
-            temperature=0.2,
-            max_output_tokens=256,
-        )
+        # Vertex AI にテキストを送信
+        instance = {"content": user_input}
+        parameters = {"temperature": 0.2, "maxOutputTokens": 256}
+
         response = client.predict(
             endpoint=endpoint,
-            instances=[instance.to_value()],
+            instances=[instance],
             parameters=parameters
         )
         print("Vertex AI response:", response)
 
-        ai_response = response.predictions[0]['content'] if response.predictions else "すみません、応答できませんでした。"
+        ai_response = response.predictions[0].get('content', "すみません、応答できませんでした。")
 
-        # Twilioに返す
+        # Twilio応答
         twiml_response = f"""
         <?xml version="1.0" encoding="UTF-8"?>
         <Response>
