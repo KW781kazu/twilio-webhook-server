@@ -1,4 +1,3 @@
-# force update for redeploy
 from flask import Flask, request, Response
 from google.cloud import aiplatform
 import os
