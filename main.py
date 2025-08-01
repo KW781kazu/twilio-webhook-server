@@ -1,54 +1,45 @@
 from flask import Flask, request, Response
-import os
 from google.cloud import aiplatform
+import os
 
 app = Flask(__name__)
 
-# プロジェクトとリージョンを環境変数から取得
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-LOCATION = "us-central1"  # リージョンを明示的に設定
+# 環境変数からプロジェクトとリージョンを取得
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "cloudrun-demo-20250701")
+LOCATION = os.getenv("GCP_REGION", "us-central1")
+MODEL_NAME = "text-bison@001"  # シンプルなBisonモデルでまず動作確認
 
 # Vertex AI 初期化
 aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
-# モデル名（最低限動作確認のため text-bison に変更）
-MODEL_NAME = "text-bison"
-
-# モデルを取得
-model = aiplatform.TextGenerationModel.from_pretrained(MODEL_NAME)
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Twilioからの音声→テキストを受け取り、Vertex AIで応答生成"""
     try:
-        data = request.form
-        transcription = data.get("SpeechResult", "")
-        print(f"Received transcription: {transcription}")
+        # Twilioから送られたデータを取得
+        user_input = request.form.get("SpeechResult", "")
+        if not user_input:
+            return twiml_response("音声が認識できませんでした。もう一度お話しください。")
 
-        # Gemini呼び出し（ここでは bison で応答を確認）
-        response = model.predict(
-            prompt=f"ユーザーの発話: {transcription}\n自然な日本語で返答してください。",
-            temperature=0.2,
-            max_output_tokens=256,
-        )
+        # Vertex AI で応答生成
+        model = aiplatform.GenerativeModel(MODEL_NAME)
+        response = model.generate_content([f"次の内容に自然な日本語で返答してください: {user_input}"])
 
-        reply_text = response.text.strip()
-        print(f"Model response: {reply_text}")
-
-        twiml_response = f"""
-            <Response>
-                <Say language="ja-JP" voice="Polly.Mizuki">{reply_text}</Say>
-            </Response>
-        """
-        return Response(twiml_response, mimetype="text/xml")
+        reply_text = response.text if response and hasattr(response, "text") else "現在お答えできません。"
+        return twiml_response(reply_text)
 
     except Exception as e:
         print(f"Error: {e}")
-        error_response = """
-            <Response>
-                <Say language="ja-JP" voice="Polly.Mizuki">現在お答えできません。後ほどおかけ直しください。</Say>
-            </Response>
-        """
-        return Response(error_response, mimetype="text/xml")
+        return twiml_response("現在お答えできません。後ほどおかけ直しください。")
+
+def twiml_response(text: str):
+    """Twilioに返すXMLレスポンス"""
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="ja-JP" voice="Polly.Mizuki">{text}</Say>
+    <Gather input="speech" language="ja-JP" timeout="5" />
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
