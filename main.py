@@ -1,5 +1,4 @@
 from flask import Flask, request, Response
-from google.cloud import aiplatform
 from google.cloud.aiplatform.gapic import PredictionServiceClient
 import os
 import traceback
@@ -9,7 +8,7 @@ app = Flask(__name__)
 # 環境変数
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = "us-central1"
-MODEL_NAME = "text-bison@001"
+MODEL_NAME = "text-bison"  # 修正：@001は削除
 
 # Prediction クライアント
 client = PredictionServiceClient()
