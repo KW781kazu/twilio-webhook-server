@@ -1,6 +1,7 @@
 Flask==2.3.3
 gunicorn==21.2.0
-google-cloud-aiplatform==1.54.0
+google-cloud-aiplatform>=1.38.0
+
 
 
 
