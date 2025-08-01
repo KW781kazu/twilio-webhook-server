@@ -7,10 +7,13 @@ app = Flask(__name__)
 # プロジェクト情報
 PROJECT_ID = "cloudrun-demo-20250701"  # あなたのプロジェクトID
 LOCATION = "us-central1"
-MODEL_NAME = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/text-bison@002"
+MODEL_NAME = "text-bison@002"  # 修正版
 
 # Vertex AI 初期化
 aiplatform.init(project=PROJECT_ID, location=LOCATION)
+
+# モデルをロード
+model = aiplatform.TextGenerationModel.from_pretrained(MODEL_NAME)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -18,16 +21,13 @@ def webhook():
         user_input = "こんにちは。お名前を教えてください。"  # 後でSTTに置き換える
 
         # Vertex AI モデル呼び出し
-        client = aiplatform.gapic.PredictionServiceClient()
-        endpoint = MODEL_NAME
-        instances = [{"prompt": user_input}]
-
-        response = client.predict(
-            endpoint=endpoint,
-            instances=instances
+        response = model.predict(
+            user_input,
+            temperature=0.2,
+            max_output_tokens=256
         )
 
-        ai_response = response.predictions[0].get("content", "すみません、うまく応答できませんでした。")
+        ai_response = response.text if response.text else "すみません、うまく応答できませんでした。"
 
         # Twilio用レスポンス
         twiml_response = f"""
