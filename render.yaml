@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: twilio-webhook-server-v2   # サービス名（任意、今の名前でもOK）
+    env: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/credentials.json

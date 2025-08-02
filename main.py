@@ -1,6 +1,5 @@
 from flask import Flask, request, Response
 from google.cloud import aiplatform
-from google.cloud.aiplatform.gapic import PredictionServiceClient
 import os
 
 app = Flask(__name__)
@@ -19,7 +18,7 @@ def webhook():
         user_input = "こんにちは。お名前を教えてください。"  # 後でSTTに置き換える
 
         # Vertex AI モデル呼び出し
-        client = PredictionServiceClient()
+        client = aiplatform.gapic.PredictionServiceClient()
         endpoint = MODEL_NAME
         instances = [{"prompt": user_input}]
 
@@ -28,8 +27,11 @@ def webhook():
             instances=instances
         )
 
-        # 応答内容を取得
-        ai_response = response.predictions[0].get("content", "すみません、うまく応答できませんでした。")
+        ai_response = ""
+        if hasattr(response, "predictions") and len(response.predictions) > 0:
+            ai_response = response.predictions[0].get("content", "")
+        if not ai_response:
+            ai_response = "すみません、うまく応答できませんでした。"
 
         # Twilio用レスポンス
         twiml_response = f"""
