@@ -1,11 +1,12 @@
 from flask import Flask, request, Response
 from google.cloud import aiplatform
 import os
+import traceback
 
 app = Flask(__name__)
 
 # プロジェクト情報
-PROJECT_ID = "cloudrun-demo-20250701"  # あなたのプロジェクトID
+PROJECT_ID = "cloudrun-demo-20250701"
 LOCATION = "us-central1"
 MODEL_NAME = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/text-bison@002"
 
@@ -15,17 +16,21 @@ aiplatform.init(project=PROJECT_ID, location=LOCATION)
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        user_input = "こんにちは。お名前を教えてください。"  # 後でSTTに置き換える
+        user_input = "こんにちは。お名前を教えてください。"
 
         # Vertex AI モデル呼び出し
+        print(f"Calling Vertex AI model: {MODEL_NAME}")
         client = aiplatform.gapic.PredictionServiceClient()
         endpoint = MODEL_NAME
         instances = [{"prompt": user_input}]
+        print(f"Instances: {instances}")
 
         response = client.predict(
             endpoint=endpoint,
             instances=instances
         )
+
+        print(f"Vertex AI response: {response}")
 
         ai_response = ""
         if hasattr(response, "predictions") and len(response.predictions) > 0:
@@ -33,7 +38,6 @@ def webhook():
         if not ai_response:
             ai_response = "すみません、うまく応答できませんでした。"
 
-        # Twilio用レスポンス
         twiml_response = f"""
         <Response>
             <Say language="ja-JP" voice="Polly.Mizuki">{ai_response}</Say>
@@ -42,7 +46,8 @@ def webhook():
         return Response(twiml_response, mimetype="text/xml")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in webhook: {e}")
+        traceback.print_exc()
         error_response = """
         <Response>
             <Say language="ja-JP" voice="Polly.Mizuki">現在お答えできません。後ほどおかけ直しください。</Say>
