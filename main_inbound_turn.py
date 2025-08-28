@@ -1,5 +1,5 @@
 # =========================
-# main_inbound_turn.py  (FULL / eventlet + flask-sock + handshake logging)
+# main_inbound_turn.py  (FULL / eventlet + flask-sock + handshake logging / fixed track)
 # =========================
 import os
 import sys
@@ -60,7 +60,6 @@ def ws_absolute_url(path: str) -> str:
 # ---------- request logging (握手の可視化) ----------
 @app.before_request
 def _log_incoming():
-    # WebSocket の Upgrade 要求や /media への到達を早期に可視化
     if request.path == "/media":
         ua = request.headers.get("User-Agent", "")
         upg = request.headers.get("Upgrade", "")
@@ -95,7 +94,9 @@ def build_twiml() -> str:
     stream_url = ws_absolute_url("/media")
     log.info(f"[TwiML] stream url -> {stream_url}")
     with vr.connect() as c:
-        c.stream(url=stream_url, track="inbound")
+        # NOTE: track は省略（既定で inbound_track になる）
+        c.stream(url=stream_url)
+        # もし明示したいなら: c.stream(url=stream_url, track="inbound_track")
     return str(vr)
 
 @app.route("/voice", methods=["GET", "POST"])
@@ -106,8 +107,6 @@ def voice() -> Response:
 # ---------- HTTP の /media (到達確認用) ----------
 @app.route("/media", methods=["GET"])
 def media_http_probe() -> Response:
-    # Twilio の WS ハンドシェイク以外（ただの GET 到達）でも 200 を返す
-    # ※ WebSocket Upgrade の場合は下の @sock.route が処理する
     return Response("media endpoint (HTTP) is alive", mimetype="text/plain")
 
 
@@ -119,7 +118,6 @@ def media_ws(ws):
     log.info("[WS] connected (handshake OK)")
 
     call_sid = None
-
     try:
         while True:
             raw = ws.receive()
@@ -139,7 +137,7 @@ def media_ws(ws):
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
             elif event == "media":
-                # 音声フレーム受信（ここではペイロードを捨てる）
+                # ここでは受信確認のみ（処理は後で実装）
                 pass
 
             elif event == "stop":
@@ -158,3 +156,4 @@ def media_ws(ws):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
