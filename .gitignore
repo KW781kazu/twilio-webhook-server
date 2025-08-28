@@ -1,0 +1,12 @@
+# virtual env
+venv/
+.env
+
+# recordings & logs
+recordings/
+logs/
+
+# OS / editor
+.DS_Store
+*.pyc
+__pycache__/
