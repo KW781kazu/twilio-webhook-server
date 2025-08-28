@@ -1,13 +1,18 @@
-Flask==3.0.3
-flask-sock==0.7.0
+# --- Web/WS 基本 ---
+Flask==2.3.3
 gunicorn==21.2.0
+
+# gevent + WebSocket
 gevent==24.2.1
 gevent-websocket==0.10.1
+flask-sockets==0.2.1
 
-requests==2.32.3
-python-dotenv==1.0.1
+# Twilio / AI
 twilio==9.2.3
+openai>=1.30.0
 
+# （双方向音声のTTSに使う場合）
+boto3>=1.34.0
 
 
 

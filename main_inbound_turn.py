@@ -109,7 +109,7 @@ def build_twiml() -> str:
     # 初期応答（Say）
     vr.say("こんにちは。こちらは受付です。ピーという音のあとにご用件をお話しください。", language="ja-JP")
 
-    # Media Streams（inbound。双方向にしたい場合は bidirectional="true" を追加）
+    # Media Streams（inbound。双方向にしたい場合は bidirectional=\"true\" を追加）
     stream_url = ws_absolute_url("/media")
     with vr.connect() as c:
         c.stream(url=stream_url, track="inbound")  # bidirectional="true" も可
@@ -185,9 +185,7 @@ def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE)
 
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        # NOTE: For true streaming, you'd accumulate a few seconds and send as wav/temp file.
-        # Here we return empty (placeholder) to keep server stable if ASR not wired yet.
-        # Implement your ASR call here when ready.
+        # 真のストリーミングは別途実装。ここでは安定運用を優先し空文字を返す。
         return ""
     except Exception as e:
         log.warning(f"[ASR] Whisper error: {e}")
@@ -196,7 +194,7 @@ def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE)
 
 def chat_generate(prompt: str, system: str = "あなたは丁寧な日本語の電話受付AIです。") -> str:
     """
-    Call GPT-4o-mini (or your chosen model) to generate a reply text.
+    Call GPT-4o-mini (または任意モデル)。
     """
     if not _openai_enabled or not OPENAI_API_KEY:
         return ""
@@ -219,15 +217,14 @@ def chat_generate(prompt: str, system: str = "あなたは丁寧な日本語の�
 
 def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
     """
-    Polly TTS -> PCM16 -> μ-law -> base64 for Twilio stream send-back.
-    For now we return None to keep server stable if Polly not configured.
+    Polly TTS -> PCM16 -> μ-law -> base64（戻し送信する場合に使用）。
+    いまは握手安定を優先し None を返す。
     """
     if not _polly_enabled:
         return None
 
     try:
         polly = boto3.client("polly", region_name=AWS_REGION)
-        # Get PCM16 8kHz (or 16kHz and downsample yourself)
         synth = polly.synthesize_speech(
             Text=text,
             OutputFormat="pcm",
@@ -236,8 +233,7 @@ def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
             LanguageCode="ja-JP",
         )
         pcm16 = synth["AudioStream"].read()
-        # Convert PCM16 -> μ-law (implement if you want to stream back to Twilio)
-        # For handshake/receive-only, we can skip returning audio.
+        # ここで μ-law 変換して返す実装を追加可能
         return None
     except Exception as e:
         log.warning(f"[TTS] Polly error: {e}")
@@ -248,11 +244,6 @@ def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
 # Simple VAD (timer-based placeholder)
 # =========================
 class SimpleTurnDetector:
-    """
-    Very simple "end-of-utterance" detector:
-    - On receiving media, update last_audio_ts
-    - If no media for idle_ms, treat as end-of-utterance
-    """
     def __init__(self, idle_ms: int = 900):
         self.idle_ms = idle_ms
         self.last_audio_ts = time.time()
@@ -270,18 +261,16 @@ class SimpleTurnDetector:
 @sockets.route("/media")
 def media_socket(ws):
     """
-    Twilio <Stream> connects here (wss).
-    We read JSON text frames with fields: event, start/media/stop, etc.
+    Twilio <Stream> がここに wss 接続します。
+    JSON テキストフレーム（event=start/media/stop）を受信します。
     """
     remote = request.environ.get("HTTP_X_FORWARDED_FOR", request.remote_addr)
     call_sid = None
     log.info("[WS] new connection request from %s", remote)
 
-    # Queues (if you later want to send audio/text back)
     send_q = gevent_queue.Queue()
     detector = SimpleTurnDetector(idle_ms=900)
 
-    # Background sender (for server->Twilio messages)
     def sender():
         try:
             while not ws.closed:
@@ -292,16 +281,14 @@ def media_socket(ws):
         except Exception as e:
             log.warning(f"[WS] sender exception: {e}")
 
-    send_thread = threading.Thread(target=sender, daemon=True)
-    send_thread.start()
+    th = threading.Thread(target=sender, daemon=True)
+    th.start()
 
     try:
-        # Handshake OK
         log.info("[WS] connected (handshake OK)")
         while not ws.closed:
             raw = ws.receive()
             if raw is None:
-                # client closed
                 break
 
             try:
@@ -317,15 +304,11 @@ def media_socket(ws):
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
             elif event == "media":
-                # Receive audio chunk
                 media = data.get("media", {})
                 payload = media.get("payload", "")
                 ulaw_bytes = decode_twilio_ulaw_b64_to_pcm(payload)
                 detector.on_audio()
-                # If doing ASR: ulaw -> pcm16, append to buffer, etc.
-                # pcm16 = ulaw_to_pcm16(ulaw_bytes)
-                # (buffer & when detector.is_silence_gap(): run ASR)
-                # Keep lightweight here to avoid blocking.
+                # pcm16 = ulaw_to_pcm16(ulaw_bytes)  # ASR するなら使用
                 pass
 
             elif event == "mark":
@@ -338,17 +321,6 @@ def media_socket(ws):
 
             else:
                 log.debug(f"[WS] event: {event}")
-
-            # Simple end-of-utterance check (placeholder)
-            # if detector.is_silence_gap():
-            #     # Example: ASR -> GPT -> TTS -> send back (if bidirectional)
-            #     # text = whisper_transcribe_pcm16(collected_pcm16)
-            #     # reply = chat_generate(text)
-            #     # b64_ulaw = polly_tts_to_ulaw_b64(reply)
-            #     # if b64_ulaw:
-            #     #     out = json.dumps({"event": "media", "media": {"payload": b64_ulaw}})
-            #     #     send_q.put(out)
-            #     pass
 
     except Exception as e:
         log.warning(f"[WS] exception: {e}")
@@ -365,6 +337,5 @@ def media_socket(ws):
 # (Gunicorn will import app object)
 # =========================
 if __name__ == "__main__":
-    # For local testing only: python main_inbound_turn.py
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
