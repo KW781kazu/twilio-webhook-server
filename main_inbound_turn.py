@@ -1,5 +1,5 @@
 # =========================
-# main_inbound_turn.py  (FULL / Flask-Sock)
+# main_inbound_turn.py  (FULL / Flask-Sock + eventlet)
 # =========================
 import os
 import sys
@@ -7,13 +7,12 @@ import json
 import time
 import base64
 import logging
-import threading
 from typing import Optional
 
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 
-# WebSocket (flask-sock)
+# WebSocket
 from flask_sock import Sock
 
 # OpenAI (optional)
@@ -31,15 +30,12 @@ except Exception:
     _polly_enabled = False
 
 
-# =========================
-# Settings
-# =========================
+# ============== Settings ==============
 APP_NAME = "twilio-media-whisper-gpt"
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "").rstrip("/")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 POLLY_VOICE = os.environ.get("POLLY_VOICE", "Mizuki")
-
 SAMPLE_RATE = 8000  # Twilio Media Streams spec
 
 logging.basicConfig(
@@ -53,9 +49,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 
-# =========================
-# Utilities
-# =========================
+# ============== Utils ==============
 def xml_response(xml_str: str) -> Response:
     return Response(xml_str, mimetype="text/xml; charset=utf-8")
 
@@ -68,9 +62,7 @@ def ws_absolute_url(path: str) -> str:
     return f"{scheme}://{host}{path}"
 
 
-# =========================
-# Health / Version
-# =========================
+# ============== Health/Version ==============
 @app.route("/healthz", methods=["GET"])
 def healthz() -> Response:
     return Response("ok", mimetype="text/plain")
@@ -79,7 +71,7 @@ def healthz() -> Response:
 def version() -> Response:
     info = {
         "app": APP_NAME,
-        "ws_path": "/media",
+        "ws_url": ws_absolute_url("/media"),
         "public_base": PUBLIC_BASE,
         "openai_enabled": _openai_enabled,
         "polly_enabled": _polly_enabled,
@@ -87,14 +79,16 @@ def version() -> Response:
     return Response(json.dumps(info), mimetype="application/json")
 
 
-# =========================
-# TwiML (GET/POST 両対応)
-# =========================
+# ============== TwiML (GET/POST) ==============
 def build_twiml() -> str:
     vr = VoiceResponse()
     vr.say("こんにちは。こちらは受付です。ピーという音のあとにご用件をお話しください。", language="ja-JP")
+
+    # Media Streams（inbound）
+    stream_url = ws_absolute_url("/media")
+    log.info(f"[TwiML] stream url -> {stream_url}")
     with vr.connect() as c:
-        c.stream(url=ws_absolute_url("/media"), track="inbound")  # 必要なら bidirectional="true"
+        c.stream(url=stream_url, track="inbound")  # 双方向にするなら bidirectional="true"
     return str(vr)
 
 @app.route("/voice", methods=["GET", "POST"])
@@ -102,9 +96,7 @@ def voice() -> Response:
     return xml_response(build_twiml())
 
 
-# =========================
-# Media helpers (placeholders)
-# =========================
+# ============== Media helpers (placeholders) ==============
 def decode_twilio_ulaw_b64_to_pcm(b64_payload: str) -> bytes:
     try:
         return base64.b64decode(b64_payload)
@@ -130,8 +122,7 @@ def ulaw_to_pcm16(ulaw_bytes: bytes) -> bytes:
     out = bytearray()
     for b in ulaw_bytes:
         s = ulaw_to_pcm16._table[b]
-        out.append(s & 0xFF)
-        out.append((s >> 8) & 0xFF)
+        out.append(s & 0xFF); out.append((s >> 8) & 0xFF)
     return bytes(out)
 
 def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> str:
@@ -139,7 +130,6 @@ def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE)
         return ""
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        # 本番は数秒バッファで WAV 化して送る。ここでは空文字で占位。
         return ""
     except Exception as e:
         log.warning(f"[ASR] Whisper error: {e}")
@@ -170,15 +160,13 @@ def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
             Text=text, OutputFormat="pcm", SampleRate=str(SAMPLE_RATE),
             VoiceId=POLLY_VOICE, LanguageCode="ja-JP"
         )
-        return None  # μ-law 変換は後で実装
+        return None
     except Exception as e:
         log.warning(f"[TTS] Polly error: {e}")
         return None
 
 
-# =========================
-# Simple VAD placeholder
-# =========================
+# ============== Simple VAD placeholder ==============
 class SimpleTurnDetector:
     def __init__(self, idle_ms: int = 900):
         self.idle_ms = idle_ms
@@ -189,22 +177,22 @@ class SimpleTurnDetector:
         return (time.time() - self.last_audio_ts) * 1000.0 > self.idle_ms
 
 
-# =========================
-# WebSocket: /media  (flask-sock)
-# =========================
+# ============== WebSocket: /media ==============
 @sock.route("/media")
 def media(ws):
-    remote = request.environ.get("HTTP_X_FORWARDED_FOR", request.remote_addr)
-    call_sid = None
-    log.info("[WS] new connection request from %s", remote)
+    # Render のプロキシ越しでも X-Forwarded-For が入る
+    remote = request.headers.get("X-Forwarded-For") or request.remote_addr
+    log.info(f"[WS] upgrade request from {remote}")
     log.info("[WS] connected (handshake OK)")
 
+    call_sid = None
     detector = SimpleTurnDetector(idle_ms=900)
 
     try:
         while True:
             raw = ws.receive()
             if raw is None:
+                log.info("[WS] client closed")
                 break
             try:
                 data = json.loads(raw)
@@ -220,10 +208,8 @@ def media(ws):
 
             elif event == "media":
                 payload = data.get("media", {}).get("payload", "")
-                ulaw_bytes = decode_twilio_ulaw_b64_to_pcm(payload)
+                _ = decode_twilio_ulaw_b64_to_pcm(payload)
                 detector.on_audio()
-                # pcm16 = ulaw_to_pcm16(ulaw_bytes)  # ASR するなら使用
-                pass
 
             elif event == "mark":
                 mark = data.get("mark", {}).get("name")
@@ -242,9 +228,7 @@ def media(ws):
         log.info("[WS] closed callSid=%s", call_sid)
 
 
-# =========================
-# Local dev
-# =========================
+# ============== Local dev ==============
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
