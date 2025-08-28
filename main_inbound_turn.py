@@ -1,5 +1,5 @@
 # =========================
-# main_inbound_turn.py  (FULL / Flask-Sock + eventlet)
+# main_inbound_turn.py  (FULL / eventlet + flask-sock + handshake logging)
 # =========================
 import os
 import sys
@@ -11,18 +11,14 @@ from typing import Optional
 
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
-
-# WebSocket
 from flask_sock import Sock
 
-# OpenAI (optional)
 try:
     from openai import OpenAI
     _openai_enabled = True
 except Exception:
     _openai_enabled = False
 
-# AWS Polly (optional)
 try:
     import boto3
     _polly_enabled = True
@@ -30,7 +26,6 @@ except Exception:
     _polly_enabled = False
 
 
-# ============== Settings ==============
 APP_NAME = "twilio-media-whisper-gpt"
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "").rstrip("/")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -49,7 +44,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 
-# ============== Utils ==============
+# ---------- utils ----------
 def xml_response(xml_str: str) -> Response:
     return Response(xml_str, mimetype="text/xml; charset=utf-8")
 
@@ -62,7 +57,21 @@ def ws_absolute_url(path: str) -> str:
     return f"{scheme}://{host}{path}"
 
 
-# ============== Health/Version ==============
+# ---------- request logging (握手の可視化) ----------
+@app.before_request
+def _log_incoming():
+    # WebSocket の Upgrade 要求や /media への到達を早期に可視化
+    if request.path == "/media":
+        ua = request.headers.get("User-Agent", "")
+        upg = request.headers.get("Upgrade", "")
+        orign = request.headers.get("Origin", "")
+        proto = request.headers.get("X-Forwarded-Proto", "")
+        log.info(f"[PRE] path=/media method={request.method} "
+                 f"upgrade={upg!r} origin={orign!r} "
+                 f"xfwd_proto={proto!r} ua={ua!r}")
+
+
+# ---------- health/version ----------
 @app.route("/healthz", methods=["GET"])
 def healthz() -> Response:
     return Response("ok", mimetype="text/plain")
@@ -79,16 +88,14 @@ def version() -> Response:
     return Response(json.dumps(info), mimetype="application/json")
 
 
-# ============== TwiML (GET/POST) ==============
+# ---------- TwiML ----------
 def build_twiml() -> str:
     vr = VoiceResponse()
     vr.say("こんにちは。こちらは受付です。ピーという音のあとにご用件をお話しください。", language="ja-JP")
-
-    # Media Streams（inbound）
     stream_url = ws_absolute_url("/media")
     log.info(f"[TwiML] stream url -> {stream_url}")
     with vr.connect() as c:
-        c.stream(url=stream_url, track="inbound")  # 双方向にするなら bidirectional="true"
+        c.stream(url=stream_url, track="inbound")
     return str(vr)
 
 @app.route("/voice", methods=["GET", "POST"])
@@ -96,97 +103,22 @@ def voice() -> Response:
     return xml_response(build_twiml())
 
 
-# ============== Media helpers (placeholders) ==============
-def decode_twilio_ulaw_b64_to_pcm(b64_payload: str) -> bytes:
-    try:
-        return base64.b64decode(b64_payload)
-    except Exception:
-        return b""
-
-def ulaw_to_pcm16(ulaw_bytes: bytes) -> bytes:
-    if not ulaw_bytes:
-        return b""
-    if not hasattr(ulaw_to_pcm16, "_table"):
-        table = []
-        for i in range(256):
-            u = ~i & 0xFF
-            sign = (u & 0x80)
-            exponent = (u >> 4) & 0x07
-            mantissa = u & 0x0F
-            magnitude = ((mantissa << 3) + 0x84) << exponent
-            sample = magnitude - 0x84
-            sample = -sample if sign else sample
-            sample = max(-32768, min(32767, sample))
-            table.append(sample & 0xFFFF)
-        ulaw_to_pcm16._table = table
-    out = bytearray()
-    for b in ulaw_bytes:
-        s = ulaw_to_pcm16._table[b]
-        out.append(s & 0xFF); out.append((s >> 8) & 0xFF)
-    return bytes(out)
-
-def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> str:
-    if not _openai_enabled or not OPENAI_API_KEY:
-        return ""
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        return ""
-    except Exception as e:
-        log.warning(f"[ASR] Whisper error: {e}")
-        return ""
-
-def chat_generate(prompt: str, system: str = "あなたは丁寧な日本語の電話受付AIです。") -> str:
-    if not _openai_enabled or not OPENAI_API_KEY:
-        return ""
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": prompt}],
-            temperature=0.4,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        log.warning(f"[NLG] Chat error: {e}")
-        return ""
-
-def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
-    if not _polly_enabled:
-        return None
-    try:
-        polly = boto3.client("polly", region_name=AWS_REGION)
-        _ = polly.synthesize_speech(
-            Text=text, OutputFormat="pcm", SampleRate=str(SAMPLE_RATE),
-            VoiceId=POLLY_VOICE, LanguageCode="ja-JP"
-        )
-        return None
-    except Exception as e:
-        log.warning(f"[TTS] Polly error: {e}")
-        return None
+# ---------- HTTP の /media (到達確認用) ----------
+@app.route("/media", methods=["GET"])
+def media_http_probe() -> Response:
+    # Twilio の WS ハンドシェイク以外（ただの GET 到達）でも 200 を返す
+    # ※ WebSocket Upgrade の場合は下の @sock.route が処理する
+    return Response("media endpoint (HTTP) is alive", mimetype="text/plain")
 
 
-# ============== Simple VAD placeholder ==============
-class SimpleTurnDetector:
-    def __init__(self, idle_ms: int = 900):
-        self.idle_ms = idle_ms
-        self.last_audio_ts = time.time()
-    def on_audio(self):
-        self.last_audio_ts = time.time()
-    def is_silence_gap(self) -> bool:
-        return (time.time() - self.last_audio_ts) * 1000.0 > self.idle_ms
-
-
-# ============== WebSocket: /media ==============
+# ---------- WebSocket: /media ----------
 @sock.route("/media")
-def media(ws):
-    # Render のプロキシ越しでも X-Forwarded-For が入る
+def media_ws(ws):
     remote = request.headers.get("X-Forwarded-For") or request.remote_addr
     log.info(f"[WS] upgrade request from {remote}")
     log.info("[WS] connected (handshake OK)")
 
     call_sid = None
-    detector = SimpleTurnDetector(idle_ms=900)
 
     try:
         while True:
@@ -207,13 +139,8 @@ def media(ws):
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
             elif event == "media":
-                payload = data.get("media", {}).get("payload", "")
-                _ = decode_twilio_ulaw_b64_to_pcm(payload)
-                detector.on_audio()
-
-            elif event == "mark":
-                mark = data.get("mark", {}).get("name")
-                log.debug(f"[WS] mark: {mark}")
+                # 音声フレーム受信（ここではペイロードを捨てる）
+                pass
 
             elif event == "stop":
                 log.info("[STATUS] stream-stopped callSid=%s", call_sid)
@@ -228,7 +155,6 @@ def media(ws):
         log.info("[WS] closed callSid=%s", call_sid)
 
 
-# ============== Local dev ==============
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
