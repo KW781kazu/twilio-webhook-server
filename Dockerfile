@@ -5,17 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 依存関係のインストール
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリ本体
 COPY . /app
 
-# Render 既定の PORT を使う（gunicorn で bind する）
 ENV PORT=10000
 
-# geventwebsocket ワーカーで起動（WS 必須）
+# geventwebsocket ワーカーで WebSocket 対応
 CMD ["gunicorn",
      "-k", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker",
      "-w", "1",
