@@ -1,271 +1,370 @@
-# main_inbound_turn.py  — Twilio Media Streams (inbound) × Whisper × gpt-4o-mini
-# 目的: 出だし欠け/取りこぼし/間の長さを抑えつつ自然に返答
+# =========================
+# main_inbound_turn.py  (FULL)
+# =========================
+import os
+import sys
+import json
+import time
+import base64
+import logging
+import queue
+import threading
+from typing import Optional, Tuple, List
 
-import os, json, time, base64, audioop, wave, io, threading
-from datetime import datetime, timezone
 from flask import Flask, request, Response
-from flask_sock import Sock
-from dotenv import load_dotenv
-import requests
-from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
 
-load_dotenv()
+# --- WebSocket (gevent) ---
+# Gunicorn worker: geventwebsocket.gunicorn.workers.GeventWebSocketWorker
+# pip: flask-sockets, gevent, gevent-websocket
+from flask_sockets import Sockets
+from gevent import queue as gevent_queue
 
-# ========== 環境変数 ==========
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL_ASR   = os.getenv("OPENAI_MODEL_ASR", "whisper-1")
-OPENAI_MODEL_CHAT  = os.getenv("OPENAI_MODEL_CHAT", "gpt-4o-mini")
-PUBLIC_BASE        = os.getenv("PUBLIC_BASE", "").rstrip("/")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
-TRACK_MODE         = "inbound"   # Twilio 側は inbound_track のみ
+# --- (Optional) OpenAI Whisper / GPT ---
+# pip: openai>=1.30
+try:
+    from openai import OpenAI
+    _openai_enabled = True
+except Exception:
+    _openai_enabled = False
 
-assert PUBLIC_BASE.startswith("https://"), "PUBLIC_BASE は https:// で始めてください"
+# --- (Optional) AWS Polly TTS ---
+# pip: boto3
+try:
+    import boto3
+    _polly_enabled = True
+except Exception:
+    _polly_enabled = False
 
-# ========== Flask / Twilio ==========
-app = Flask(__name__)
-sock = Sock(app)
-tw = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-INSTRUCTIONS_JA = (
-    "あなたは「フロントガラス修理ナビ」のAI電話受付アシスタントです。"
-    "丁寧だが長すぎない口語で、相手の直近の発話へ短く共感→“次の1問だけ”を聞く。"
-    "収集: 破損箇所/見積希望/車検証の有無/郵便番号/車種/初年度登録/車台番号/型式指定(5桁)/類別区分(4桁)。"
-    "雑談は短く、やさしく本筋へ戻す。"
+# =========================
+# Settings
+# =========================
+APP_NAME = "twilio-media-whisper-gpt"
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "").rstrip("/")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
+POLLY_VOICE = os.environ.get("POLLY_VOICE", "Mizuki")
+
+# Twilio Media Streams audio spec
+SAMPLE_RATE = 8000  # Hz
+CHANNELS = 1
+# Twilio sends μ-law (PCMU) 8kHz mono, base64 in "media.payload"
+
+# Logging
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
 )
+log = logging.getLogger(APP_NAME)
 
-os.makedirs("recordings", exist_ok=True)
-os.makedirs("logs", exist_ok=True)
+app = Flask(__name__)
+sockets = Sockets(app)
 
-def stream_ws_url():   return PUBLIC_BASE.replace("https://", "wss://") + "/media"
-def status_cb_url():   return PUBLIC_BASE + "/stream-status"
 
-# ヘルスチェック用（Render で 200 を返すエンドポイント）
-@app.get("/")
-def root_ok():
-    return "ok", 200
+# =========================
+# Utility
+# =========================
+def xml_response(xml_str: str) -> Response:
+    return Response(xml_str, mimetype="text/xml; charset=utf-8")
 
-# ========== TwiML（着信時） ==========
-@app.route("/voice", methods=["POST"])
-def voice():
-    twiml = f"""
-<Response>
-  <Say language="ja-JP" voice="Polly.Mizuki">フロントガラス修理ナビです。AIアシスタントが受付いたします。どうぞよろしくお願いいたします。</Say>
-  <Connect>
-    <Stream track="{TRACK_MODE}_track"
-            url="{stream_ws_url()}"
-            statusCallbackMethod="POST"
-            statusCallback="{status_cb_url()}" />
-  </Connect>
-</Response>
-""".strip()
-    return Response(twiml, mimetype="text/xml")
 
-# ========== Stream 状態ログ ==========
-@app.route("/stream-status", methods=["POST"])
-def stream_status():
-    with open("logs/stream_status.log", "a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
-                            "form": request.form.to_dict()}, ensure_ascii=False) + "\n")
-    return ("", 204)
+def is_secure_base() -> bool:
+    return PUBLIC_BASE.startswith("https://")
 
-# ========== VAD（適応 + 前後パディング + 最短長） ==========
-# 20ms@8k μ-law フレーム
-ULAW_FRAME = 160
 
-class AdaptiveVAD:
-    """最初の1秒でノイズ平均→しきい値決定。語頭160ms/語尾280ms基準、最短600ms、上限3.5s。"""
-    def __init__(self):
-        self.learn_frames = 50       # 1s (50*20ms)
-        self.learn_sum = 0
-        self.learn_cnt = 0
-        self.thr_on  = 1200
-        self.thr_off = 850
-        self.in_speech = False
-        self.on_cnt = 0
-        self.off_cnt = 0
-        self.buf = bytearray()
-        self.pre = bytearray()       # 語頭パディング用
-        self.min_start_frames = 8    # 160ms
-        self.min_end_frames   = 14   # 280ms
-        self.min_seg_ms       = 600
-        self.max_seg_ms       = 3500
+def ws_absolute_url(path: str) -> str:
+    # Twilio requires wss
+    host = PUBLIC_BASE.replace("https://", "").replace("http://", "")
+    scheme = "wss" if is_secure_base() else "ws"
+    return f"{scheme}://{host}{path}"
 
-    def feed(self, ulaw_bytes):
-        pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)
-        rms = audioop.rms(pcm16, 2)
 
-        # 常に200msプリロールを保持（語頭欠け防止）
-        self.pre += pcm16
-        max_pre = int(0.2 * 8000) * 2
-        if len(self.pre) > max_pre:
-            self.pre = self.pre[-max_pre:]
+# =========================
+# Health / Version
+# =========================
+@app.route("/healthz", methods=["GET"])
+def healthz() -> Response:
+    return Response("ok", mimetype="text/plain")
 
-        # 学習フェーズ
-        if self.learn_cnt < self.learn_frames:
-            self.learn_sum += rms
-            self.learn_cnt += 1
-            if self.learn_cnt == self.learn_frames:
-                avg = self.learn_sum / max(1, self.learn_cnt)
-                self.thr_on  = max(int(avg*2.0 + 250), 1100)
-                self.thr_off = max(int(avg*1.3 + 120), 800)
-                print(f"[VAD] learned avg={avg:.1f} -> thr_on={self.thr_on}, thr_off={self.thr_off}")
-            return None
 
-        # 判定
-        if not self.in_speech:
-            if rms >= self.thr_on:
-                self.on_cnt += 1
-                if self.on_cnt >= self.min_start_frames:
-                    self.in_speech = True
-                    self.buf += self.pre   # 語頭にプリロールを付与
-                    self.buf += pcm16
-                    self.on_cnt = 0
-            else:
-                self.on_cnt = 0
-        else:
-            self.buf += pcm16
-            seg_ms = int(len(self.buf)/2/8000*1000)
-            if rms < self.thr_off:
-                self.off_cnt += 1
-            else:
-                self.off_cnt = 0
+@app.route("/version", methods=["GET"])
+def version() -> Response:
+    info = {
+        "app": APP_NAME,
+        "ws_path": "/media",
+        "public_base": PUBLIC_BASE,
+        "openai_enabled": _openai_enabled,
+        "polly_enabled": _polly_enabled,
+    }
+    return Response(json.dumps(info), mimetype="application/json")
 
-            if self.off_cnt >= self.min_end_frames or seg_ms >= self.max_seg_ms:
-                data = bytes(self.buf)
-                self.buf.clear()
-                self.off_cnt = 0
-                self.in_speech = False
-                if seg_ms < self.min_seg_ms:
-                    return None
-                return data
+
+# =========================
+# TwiML (GET/POST both OK)
+# =========================
+def build_twiml() -> str:
+    vr = VoiceResponse()
+    # 初期応答（Say）
+    vr.say("こんにちは。こちらは受付です。ピーという音のあとにご用件をお話しください。", language="ja-JP")
+
+    # Media Streams（inbound。双方向にしたい場合は bidirectional="true" を追加）
+    stream_url = ws_absolute_url("/media")
+    with vr.connect() as c:
+        c.stream(url=stream_url, track="inbound")  # bidirectional="true" も可
+
+    return str(vr)
+
+
+@app.route("/voice", methods=["GET", "POST"])
+def voice() -> Response:
+    # GET/POST いずれでも同じ TwiML を返す（デバッグ用）
+    xml = build_twiml()
+    return xml_response(xml)
+
+
+# =========================
+# Audio / ASR / NLG / TTS (placeholders)
+# =========================
+def decode_twilio_ulaw_b64_to_pcm(b64_payload: str) -> bytes:
+    """
+    Twilio sends base64 μ-law frames. Here we simply return raw bytes (μ-law).
+    If your ASR expects linear PCM, you must convert μ-law -> PCM16 8kHz.
+    """
+    try:
+        return base64.b64decode(b64_payload)
+    except Exception:
+        return b""
+
+
+def ulaw_to_pcm16(ulaw_bytes: bytes) -> bytes:
+    """
+    μ-law -> PCM16 conversion (lookup-table based).
+    To keep this file self-contained, we implement a simple converter.
+    """
+    if not ulaw_bytes:
+        return b""
+
+    # μ-law decode table
+    # Precompute only once
+    if not hasattr(ulaw_to_pcm16, "_table"):
+        table = []
+        for i in range(256):
+            u = ~i & 0xFF
+            sign = (u & 0x80)
+            exponent = (u >> 4) & 0x07
+            mantissa = u & 0x0F
+            magnitude = ((mantissa << 3) + 0x84) << exponent
+            sample = magnitude - 0x84
+            sample = -sample if sign else sample
+            # clamp to 16-bit
+            if sample > 32767:
+                sample = 32767
+            if sample < -32768:
+                sample = -32768
+            table.append(sample & 0xFFFF)
+        ulaw_to_pcm16._table = table
+
+    out = bytearray()
+    tbl = ulaw_to_pcm16._table
+    for b in ulaw_bytes:
+        s = tbl[b]
+        out.append(s & 0xFF)
+        out.append((s >> 8) & 0xFF)
+    return bytes(out)
+
+
+def whisper_transcribe_pcm16(pcm16_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> str:
+    """
+    Send audio chunk to Whisper (OpenAI). Keep short to reduce latency.
+    You can replace with your own streaming ASR.
+    """
+    if not _openai_enabled or not OPENAI_API_KEY:
+        return ""
+
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # NOTE: For true streaming, you'd accumulate a few seconds and send as wav/temp file.
+        # Here we return empty (placeholder) to keep server stable if ASR not wired yet.
+        # Implement your ASR call here when ready.
+        return ""
+    except Exception as e:
+        log.warning(f"[ASR] Whisper error: {e}")
+        return ""
+
+
+def chat_generate(prompt: str, system: str = "あなたは丁寧な日本語の電話受付AIです。") -> str:
+    """
+    Call GPT-4o-mini (or your chosen model) to generate a reply text.
+    """
+    if not _openai_enabled or not OPENAI_API_KEY:
+        return ""
+
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.warning(f"[NLG] Chat error: {e}")
+        return ""
+
+
+def polly_tts_to_ulaw_b64(text: str) -> Optional[str]:
+    """
+    Polly TTS -> PCM16 -> μ-law -> base64 for Twilio stream send-back.
+    For now we return None to keep server stable if Polly not configured.
+    """
+    if not _polly_enabled:
         return None
 
-def pcm8k_to_wav16k_norm(pcm16_8k: bytes) -> bytes:
-    # 8k→16kへ補間
-    pcm16_16k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 16000, None)
-    # 目標 -3 dBFS に正規化
-    peak = max(1, audioop.max(pcm16_16k, 2))
-    target = int(32767 * (10**(-3/20)))
-    gain = min(3.0, target/peak)
-    pcm16_16k = audioop.mul(pcm16_16k, 2, gain)
-    # 前後100msの無音パッド
-    pad = b"\x00" * int(0.1 * 16000) * 2
-    pcm16_16k = pad + pcm16_16k + pad
+    try:
+        polly = boto3.client("polly", region_name=AWS_REGION)
+        # Get PCM16 8kHz (or 16kHz and downsample yourself)
+        synth = polly.synthesize_speech(
+            Text=text,
+            OutputFormat="pcm",
+            SampleRate=str(SAMPLE_RATE),
+            VoiceId=POLLY_VOICE,
+            LanguageCode="ja-JP",
+        )
+        pcm16 = synth["AudioStream"].read()
+        # Convert PCM16 -> μ-law (implement if you want to stream back to Twilio)
+        # For handshake/receive-only, we can skip returning audio.
+        return None
+    except Exception as e:
+        log.warning(f"[TTS] Polly error: {e}")
+        return None
 
-    bio = io.BytesIO()
-    with wave.open(bio, "wb") as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
-        wf.writeframes(pcm16_16k)
-    return bio.getvalue()
 
-def whisper_transcribe(wav_bytes: bytes, lang="ja") -> str:
-    files = {"file": ("turn.wav", wav_bytes, "audio/wav")}
-    data  = {"model": OPENAI_MODEL_ASR, "language": lang}
-    r = requests.post("https://api.openai.com/v1/audio/transcriptions",
-                      headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                      data=data, files=files, timeout=60)
-    r.raise_for_status()
-    return (r.json().get("text") or "").strip()
+# =========================
+# Simple VAD (timer-based placeholder)
+# =========================
+class SimpleTurnDetector:
+    """
+    Very simple "end-of-utterance" detector:
+    - On receiving media, update last_audio_ts
+    - If no media for idle_ms, treat as end-of-utterance
+    """
+    def __init__(self, idle_ms: int = 900):
+        self.idle_ms = idle_ms
+        self.last_audio_ts = time.time()
 
-def chat_reply(user_text: str) -> str:
-    sys = INSTRUCTIONS_JA
-    usr = f"お客様の直近の発話:「{user_text}」。短く共感→次の1問だけ聞いて。"
-    payload = {"model": OPENAI_MODEL_CHAT,
-               "messages":[{"role":"system","content":sys},
-                           {"role":"user","content":usr}],
-               "max_tokens": 120, "temperature": 0.3}
-    r = requests.post("https://api.openai.com/v1/chat/completions",
-                      headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                               "Content-Type":"application/json"},
-                      data=json.dumps(payload), timeout=60)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    def on_audio(self):
+        self.last_audio_ts = time.time()
 
-def ssml(text: str) -> str:
-    esc = (text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-    return f'<speak><prosody rate="97%" pitch="+2st" volume="+1dB">{esc}</prosody></speak>'
+    def is_silence_gap(self) -> bool:
+        return (time.time() - self.last_audio_ts) * 1000.0 > self.idle_ms
 
-def twiml_say_again(call_sid: str, text: str):
-    twiml = f"""
-<Response>
-  <Say language="ja-JP" voice="Polly.Mizuki">{ssml(text)}</Say>
-  <Connect>
-    <Stream track="{TRACK_MODE}_track"
-            url="{stream_ws_url()}"
-            statusCallbackMethod="POST"
-            statusCallback="{status_cb_url()}" />
-  </Connect>
-</Response>
-""".strip()
-    tw.calls(call_sid).update(twiml=twiml)
 
-# ========== Media WS（片方向） ==========
-@sock.route("/media")
-def media(ws):
+# =========================
+# WebSocket: /media
+# =========================
+@sockets.route("/media")
+def media_socket(ws):
+    """
+    Twilio <Stream> connects here (wss).
+    We read JSON text frames with fields: event, start/media/stop, etc.
+    """
+    remote = request.environ.get("HTTP_X_FORWARDED_FOR", request.remote_addr)
     call_sid = None
-    vad = AdaptiveVAD()
+    log.info("[WS] new connection request from %s", remote)
 
-    rec_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_pcm_path = f"recordings/{rec_id}.pcm8k"
-    txt_log_path = f"recordings/{rec_id}.txt"
-    fpcm = open(raw_pcm_path, "ab")
+    # Queues (if you later want to send audio/text back)
+    send_q = gevent_queue.Queue()
+    detector = SimpleTurnDetector(idle_ms=900)
+
+    # Background sender (for server->Twilio messages)
+    def sender():
+        try:
+            while not ws.closed:
+                msg = send_q.get()
+                if msg is None:
+                    break
+                ws.send(msg)
+        except Exception as e:
+            log.warning(f"[WS] sender exception: {e}")
+
+    send_thread = threading.Thread(target=sender, daemon=True)
+    send_thread.start()
 
     try:
-        while True:
-            msg = ws.receive()
-            if msg is None: break
-            evt = json.loads(msg); et = evt.get("event")
-
-            if et == "start":
-                call_sid = evt["start"]["callSid"]
-                print(f"[WS] connected (handshake OK) callSid={call_sid}")
-                continue
-
-            if et == "media":
-                ulaw = base64.b64decode(evt["media"]["payload"])
-                pcm16 = audioop.ulaw2lin(ulaw, 2)
-                fpcm.write(pcm16)
-                seg = vad.feed(ulaw)
-                if seg:
-                    threading.Thread(target=_process_turn,
-                                     args=(call_sid, seg, txt_log_path),
-                                     daemon=True).start()
-                continue
-
-            if et == "stop":
-                print("[WS] stop event")
+        # Handshake OK
+        log.info("[WS] connected (handshake OK)")
+        while not ws.closed:
+            raw = ws.receive()
+            if raw is None:
+                # client closed
                 break
-    finally:
-        try: fpcm.close()
-        except: pass
 
-def _process_turn(call_sid: str, pcm16_8k: bytes, txt_path: str):
-    try:
-        wav = pcm8k_to_wav16k_norm(pcm16_8k)
-        turn_id = datetime.now().strftime("%H%M%S_%f")
-        with open(f"recordings/{turn_id}.wav", "wb") as wf:
-            wf.write(wav)
+            try:
+                data = json.loads(raw)
+            except Exception:
+                log.debug("[WS] non-JSON frame ignored")
+                continue
 
-        t0 = time.time()
-        user_text = whisper_transcribe(wav, lang="ja")
-        t_asr = int((time.time()-t0)*1000)
-        if not user_text: return
+            event = data.get("event")
+            if event == "start":
+                call_sid = data.get("start", {}).get("callSid")
+                stream_sid = data.get("start", {}).get("streamSid")
+                log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
-        reply = chat_reply(user_text)
-        with open(txt_path, "a", encoding="utf-8") as f:
-            f.write(f"[{turn_id}] U:{user_text}\n[{turn_id}] A:{reply}\n")
+            elif event == "media":
+                # Receive audio chunk
+                media = data.get("media", {})
+                payload = media.get("payload", "")
+                ulaw_bytes = decode_twilio_ulaw_b64_to_pcm(payload)
+                detector.on_audio()
+                # If doing ASR: ulaw -> pcm16, append to buffer, etc.
+                # pcm16 = ulaw_to_pcm16(ulaw_bytes)
+                # (buffer & when detector.is_silence_gap(): run ASR)
+                # Keep lightweight here to avoid blocking.
+                pass
 
-        print(f"[TURN] ASR {t_asr}ms  text='{user_text}'  -> reply='{reply[:32]}…'")
-        twiml_say_again(call_sid, reply)
+            elif event == "mark":
+                mark = data.get("mark", {}).get("name")
+                log.debug(f"[WS] mark: {mark}")
+
+            elif event == "stop":
+                log.info("[STATUS] stream-stopped callSid=%s", call_sid)
+                break
+
+            else:
+                log.debug(f"[WS] event: {event}")
+
+            # Simple end-of-utterance check (placeholder)
+            # if detector.is_silence_gap():
+            #     # Example: ASR -> GPT -> TTS -> send back (if bidirectional)
+            #     # text = whisper_transcribe_pcm16(collected_pcm16)
+            #     # reply = chat_generate(text)
+            #     # b64_ulaw = polly_tts_to_ulaw_b64(reply)
+            #     # if b64_ulaw:
+            #     #     out = json.dumps({"event": "media", "media": {"payload": b64_ulaw}})
+            #     #     send_q.put(out)
+            #     pass
 
     except Exception as e:
-        with open("logs/errors.log", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now().isoformat()} process_turn ERR: {repr(e)}\n")
+        log.warning(f"[WS] exception: {e}")
+    finally:
+        try:
+            send_q.put(None)
+        except Exception:
+            pass
+        log.info("[WS] closed callSid=%s", call_sid)
 
-# ========== Entrypoint（ローカル用） ==========
+
+# =========================
+# Local dev entrypoint
+# (Gunicorn will import app object)
+# =========================
 if __name__ == "__main__":
-    print(f">>> Starting server on http://0.0.0.0:5000 (TRACK_MODE={TRACK_MODE})")
-    print("PUBLIC_BASE =", PUBLIC_BASE)
-    print("Stream WS  =", stream_ws_url())
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # For local testing only: python main_inbound_turn.py
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
