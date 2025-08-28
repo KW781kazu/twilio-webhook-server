@@ -1,14 +1,11 @@
 Flask==3.0.0
 flask-sock==0.7.0
 gunicorn==21.2.0
-gevent==23.9.1
+gevent==24.2.1
 gevent-websocket==0.10.1
-requests
-python-dotenv
-twilio
-
-
-
+twilio==9.2.3
+requests==2.32.3
+python-dotenv==1.0.1
 
 
 
