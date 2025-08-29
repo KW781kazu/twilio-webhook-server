@@ -1,5 +1,5 @@
 # =========================
-# main_inbound_turn.py  (FULL / eventlet + flask-sock + one-way response via Calls API)
+# main_inbound_turn.py  (FULL / eventlet + flask-sock / inbound_track + statusCallback)
 # =========================
 import os
 import sys
@@ -15,8 +15,6 @@ from typing import Optional, Dict, List
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from flask_sock import Sock
-
-# Twilio REST (通話中にTwiMLを更新するために使用)
 from twilio.rest import Client as TwilioClient
 
 # OpenAI (Whisper / GPT)
@@ -26,11 +24,6 @@ try:
 except Exception:
     _openai_enabled = False
 
-# Polly は未使用（片方向なので再生は <Say>）
-_polly_enabled = False
-
-
-# ===== Settings =====
 APP_NAME = "twilio-media-whisper-gpt"
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "").rstrip("/")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -38,8 +31,8 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000          # Twilio Media Streams は 8kHz μ-law
-VAD_IDLE_MS = 1000          # 無音判定（ms）
-MIN_UTTER_MS = 800          # 認識に投げる最小発話長（ms）
+VAD_IDLE_MS = 1000
+MIN_UTTER_MS = 800
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -51,14 +44,11 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 sock = Sock(app)
 
-# Twilio REST client
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# OpenAI client
-oai_client = OpenAI(api_key=OPENAI_API_KEY) if _openai_enabled and OPENAI_API_KEY else None
+oai_client = OpenAI(api_key=OPENAI_API_KEY) if (_openai_enabled and OPENAI_API_KEY) else None
 
 
-# ===== Utilities =====
+# ---------- utils ----------
 def xml_response(xml_str: str) -> Response:
     return Response(xml_str, mimetype="text/xml; charset=utf-8")
 
@@ -71,18 +61,21 @@ def ws_absolute_url(path: str) -> str:
     return f"{scheme}://{host}{path}"
 
 def build_reconnect_twiml(say_text: str) -> str:
-    """
-    <Say> で応答再生 → <Connect><Stream .../></Connect> で WS 再接続
-    """
     vr = VoiceResponse()
     if say_text.strip():
         vr.say(say_text, language="ja-JP")
     with vr.connect() as c:
-        c.stream(url=ws_absolute_url("/media"))  # track は省略（デフォルトで inbound）
+        c.stream(
+            url=ws_absolute_url("/media"),
+            track="inbound_track",
+            status_callback=f"{PUBLIC_BASE}/ms-status",
+            status_callback_method="POST",
+            status_callback_events="start stop"
+        )
     return str(vr)
 
 
-# ===== Health / Version =====
+# ---------- health/version ----------
 @app.route("/healthz", methods=["GET"])
 def healthz() -> Response:
     return Response("ok", mimetype="text/plain")
@@ -98,14 +91,22 @@ def version() -> Response:
     return Response(json.dumps(info), mimetype="application/json")
 
 
-# ===== TwiML (初期応答＋ストリーム開始) =====
+# ---------- initial TwiML ----------
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
-    vr.say("こんにちは。こちらは受付です。ピーのあとにご用件をお話しください。", language="ja-JP")
+    vr.say("こんにちは。こちらは受付です。", language="ja-JP")
+    vr.pause(length=1)  # ビープ代わりの1秒ポーズ
+    vr.say("このあとご用件をお話しください。", language="ja-JP")
     stream_url = ws_absolute_url("/media")
     log.info(f"[TwiML] stream url -> {stream_url}")
     with vr.connect() as c:
-        c.stream(url=stream_url)
+        c.stream(
+            url=stream_url,
+            track="inbound_track",
+            status_callback=f"{PUBLIC_BASE}/ms-status",
+            status_callback_method="POST",
+            status_callback_events="start stop"
+        )
     return str(vr)
 
 @app.route("/voice", methods=["GET", "POST"])
@@ -113,20 +114,27 @@ def voice() -> Response:
     return xml_response(build_initial_twiml())
 
 
-# ===== /media の HTTP到達確認（WS以外のGETでも200） =====
-@app.route("/media", methods=["GET"])
-def media_http_probe() -> Response:
-    return Response("media endpoint (HTTP) is alive", mimetype="text/plain")
+# ---------- Media Streams status callback ----------
+@app.route("/ms-status", methods=["POST"])
+def ms_status():
+    # Twilio からの start/stop 通知（HTTP）を受けてログに出す
+    payload = request.form or request.json or {}
+    # 代表的な項目（ドキュメント準拠）
+    event = payload.get("StatusCallbackEvent") or payload.get("Event") or "unknown"
+    call_sid = payload.get("CallSid") or payload.get("callSid")
+    stream_sid = payload.get("StreamSid") or payload.get("streamSid")
+    reason = payload.get("Reason") or payload.get("StopReason")
+    log.info(f"[MS-STATUS] event={event} callSid={call_sid} streamSid={stream_sid} reason={reason} raw={dict(payload)}")
+    return Response("ok", mimetype="text/plain")
 
 
-# ===== μ-law utilities =====
+# ---------- μ-law utils ----------
 def decode_ulaw_b64(b64_payload: str) -> bytes:
     try:
         return base64.b64decode(b64_payload)
     except Exception:
         return b""
 
-# μ-law -> PCM16 (8kHz mono)
 def ulaw_to_pcm16(ulaw_bytes: bytes) -> bytes:
     if not ulaw_bytes:
         return b""
@@ -151,84 +159,56 @@ def ulaw_to_pcm16(ulaw_bytes: bytes) -> bytes:
 
 def write_wav_8k_pcm16(pcm16_bytes: bytes, path: str):
     with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16bit
-        wf.setframerate(SAMPLE_RATE)
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm16_bytes)
 
 
-# ===== Very simple VAD =====
+# ---------- simple VAD ----------
 class SimpleVAD:
     def __init__(self, idle_ms: int):
         self.idle_ms = idle_ms
         self.last_ts = time.time()
-
-    def on_audio(self):
-        self.last_ts = time.time()
-
-    def silence_ms(self) -> float:
-        return (time.time() - self.last_ts) * 1000.0
-
-    def is_end_of_utterance(self) -> bool:
-        return self.silence_ms() > self.idle_ms
+    def on_audio(self): self.last_ts = time.time()
+    def is_end(self) -> bool: return (time.time() - self.last_ts) * 1000.0 > self.idle_ms
 
 
-# ===== Per-call buffer =====
+# ---------- per-call buffers ----------
 class CallBuffer:
     def __init__(self, call_sid: str):
         self.call_sid = call_sid
         self.ulaw_chunks: List[bytes] = []
-        self.started_at = time.time()
-
     def append_ulaw(self, b: bytes):
-        if b:
-            self.ulaw_chunks.append(b)
-
-    def reset(self):
-        self.ulaw_chunks.clear()
-
+        if b: self.ulaw_chunks.append(b)
+    def reset(self): self.ulaw_chunks.clear()
     def total_ms(self) -> int:
-        # μ-law 8kHz mono: 8000 bytes ≒ 1秒（おおよそ）
         total = sum(len(c) for c in self.ulaw_chunks)
-        return int(total / 8)  # 8000 bytes ≒ 1000ms → /8 でms換算近似
-
+        return int(total / 8)  # 8000 bytes ≒ 1000ms
     def export_wav_path(self) -> Optional[str]:
-        if not self.ulaw_chunks:
-            return None
+        if not self.ulaw_chunks: return None
         pcm16 = ulaw_to_pcm16(b"".join(self.ulaw_chunks))
         path = f"/tmp/{self.call_sid}_{uuid.uuid4().hex}.wav"
         write_wav_8k_pcm16(pcm16, path)
         return path
 
-
-# ===== State =====
 call_buffers: Dict[str, CallBuffer] = {}
 call_vads: Dict[str, SimpleVAD] = {}
 
 
-# ===== Speech pipeline =====
+# ---------- speech pipeline ----------
 def run_pipeline_and_reply(call_sid: str, wav_path: Optional[str]):
-    """
-    Whisper -> GPT -> Twilio Calls API で <Say> 再生＆<Stream> 再接続
-    """
     try:
-        # 1) ASR
+        # 1) Whisper
         text = ""
         if wav_path and oai_client:
             try:
                 with open(wav_path, "rb") as f:
-                    tr = oai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        # language="ja"  # Whisperは自動判定でもOK
-                    )
+                    tr = oai_client.audio.transcriptions.create(model="whisper-1", file=f)
                 text = (tr.text or "").strip()
             except Exception as e:
                 log.warning(f"[ASR] Whisper error: {e}")
-
         log.info(f"[ASR] text='{text}'")
 
-        # 2) GPT 応答（空白なら聞き返し）
+        # 2) GPT
         reply = "恐れ入ります、もう一度ゆっくりお話しください。"
         if text:
             try:
@@ -243,24 +223,20 @@ def run_pipeline_and_reply(call_sid: str, wav_path: Optional[str]):
                 reply = cr.choices[0].message.content.strip()
             except Exception as e:
                 log.warning(f"[NLG] Chat error: {e}")
-
         log.info(f"[NLG] reply='{reply}'")
 
-        # 3) 通話中の TwiML を更新して再生 → 再接続
+        # 3) TwiML 更新（Say → Stream再接続）
         twiml = build_reconnect_twiml(reply)
         twilio_client.calls(call_sid).update(twiml=twiml)
         log.info(f"[TwiML-UPDATE] replied and reconnected stream for callSid={call_sid}")
 
     finally:
-        # 後片付け
         try:
-            if wav_path and os.path.exists(wav_path):
-                os.remove(wav_path)
-        except Exception:
-            pass
+            if wav_path and os.path.exists(wav_path): os.remove(wav_path)
+        except Exception: pass
 
 
-# ===== WebSocket: /media =====
+# ---------- request logging ----------
 @app.before_request
 def _log_incoming():
     if request.path == "/media":
@@ -268,9 +244,10 @@ def _log_incoming():
         upg = request.headers.get("Upgrade", "")
         origin = request.headers.get("Origin", "")
         proto = request.headers.get("X-Forwarded-Proto", "")
-        log.info(f"[PRE] path=/media method={request.method} "
-                 f"upgrade={upg!r} origin={origin!r} xfwd_proto={proto!r} ua={ua!r}")
+        log.info(f"[PRE] path=/media method={request.method} upgrade={upg!r} origin={origin!r} xfwd_proto={proto!r} ua={ua!r}")
 
+
+# ---------- WebSocket: /media ----------
 @sock.route("/media")
 def media_ws(ws):
     call_sid = None
@@ -297,17 +274,14 @@ def media_ws(ws):
 
             elif event == "media" and call_sid:
                 payload = data.get("media", {}).get("payload", "")
-                ulaw = decode_ulaw_b64(payload)
+                ulaw = base64.b64decode(payload) if payload else b""
                 call_buffers[call_sid].append_ulaw(ulaw)
                 call_vads[call_sid].on_audio()
 
-                # VAD: 発話終了を検知したら処理スレッドへ
-                if call_buffers[call_sid].total_ms() >= MIN_UTTER_MS and call_vads[call_sid].is_end_of_utterance():
+                if call_buffers[call_sid].total_ms() >= MIN_UTTER_MS and call_vads[call_sid].is_end():
                     buf = call_buffers[call_sid]
                     wav_path = buf.export_wav_path()
-                    # 次の発話用にバッファをリセット
                     buf.reset()
-                    # Whisper->GPT->TwiML更新を別スレで実行（通話を止めない）
                     threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
 
             elif event == "stop":
@@ -323,7 +297,7 @@ def media_ws(ws):
         log.info(f"[WS] closed callSid={call_sid}")
 
 
-# ===== Local dev =====
+# ---------- local dev ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
