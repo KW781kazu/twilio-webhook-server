@@ -1,5 +1,7 @@
 # =========================
-# main_inbound_turn.py  (one-way pipeline: Whisper -> GPT -> Say -> reconnect Stream)
+# main_inbound_turn.py
+# One-way: Twilio(Media Streams) -> Whisper -> GPT -> <Say> -> reconnect <Stream>
+# 内容ベースのVAD（μ-law無音判定）で発話区切り
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading
 from typing import Optional, Dict, List
@@ -22,8 +24,9 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000
-VAD_IDLE_MS = 1000           # 無音1sで区切り
-MIN_UTTER_MS = 800           # 0.8s以上で処理
+VAD_IDLE_MS = 900            # 有声→無声のギャップがこの時間を超えたら一区切り
+MIN_UTTER_MS = 700           # 最低発話長（短すぎる断片を防ぐ）
+SILENCE_RATIO = 0.90         # フレーム内の 0xFF 比率がこれ以上なら“無音”とみなす
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
@@ -55,7 +58,7 @@ def build_reconnect_twiml(say_text: str) -> str:
             track="inbound_track",
             status_callback=f"{PUBLIC_BASE}/ms-status",
             status_callback_method="POST",
-            status_callback_event="start end"   # ← 正しい属性名（単数）
+            status_callback_event="start end"
         )
     return str(vr)
 
@@ -77,7 +80,7 @@ def version():
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
     vr.say("こんにちは。こちらは受付です。", language="ja-JP")
-    vr.pause(length=1)  # ビープ代わりのポーズ
+    vr.pause(length=1)
     vr.say("このあとご用件をお話しください。", language="ja-JP")
     with vr.connect() as c:
         c.stream(
@@ -94,7 +97,7 @@ def build_initial_twiml() -> str:
 def voice(): return xml_response(build_initial_twiml())
 
 
-# ---------- Media Streams status callback（理由をログに出す） ----------
+# ---------- Media Streams status callback ----------
 @app.route("/ms-status", methods=["POST"])
 def ms_status():
     payload = request.form or request.json or {}
@@ -126,14 +129,27 @@ def write_wav_8k_pcm16(pcm16: bytes, path: str):
         wf.writeframes(pcm16)
 
 
-# ---------- 簡易VAD ----------
-class SimpleVAD:
+# ---------- VAD（内容ベース） ----------
+class ContentVAD:
+    """
+    μ-law 1バイト=1サンプル。0xFF が “デジタルサイレンス” とみなされることが多い。
+    1フレーム内で 0xFF が SILENCE_RATIO 以上なら無音。そうでなければ“有声”。
+    """
     def __init__(self, idle_ms:int):
-        self.idle_ms=idle_ms
-        self.last_ts=time.time()
-    def on_audio(self): self.last_ts=time.time()
-    def gap_ms(self)->float: return (time.time()-self.last_ts)*1000.0
-    def is_end(self)->bool: return self.gap_ms() > self.idle_ms
+        self.idle_ms = idle_ms
+        self.last_voiced_ts = time.time()  # 最後に“有声”を検出した時刻
+    def on_frame(self, ulaw: bytes, silence_ratio: float) -> None:
+        if not ulaw:
+            return
+        silent_count = ulaw.count(0xFF)
+        ratio = silent_count / float(len(ulaw))
+        if ratio < silence_ratio:
+            # 有声フレーム
+            self.last_voiced_ts = time.time()
+    def silence_ms(self) -> float:
+        return (time.time() - self.last_voiced_ts) * 1000.0
+    def is_segment_boundary(self) -> bool:
+        return self.silence_ms() > self.idle_ms
 
 
 # ---------- バッファ ----------
@@ -144,7 +160,7 @@ class CallBuffer:
     def append(self, b:bytes):
         if b: self.ulaw_chunks.append(b)
     def total_ms(self)->int:
-        return int(sum(len(c) for c in self.ulaw_chunks) / 8)  # 8000B ≒ 1s
+        return int(sum(len(c) for c in self.ulaw_chunks) / 8)  # ≒ 1,000ms/8,000B
     def reset(self): self.ulaw_chunks.clear()
     def export_wav(self)->Optional[str]:
         if not self.ulaw_chunks: return None
@@ -203,7 +219,7 @@ def _pre_log():
 from collections import defaultdict
 states: Dict[str, Dict[str,int]] = defaultdict(lambda: {"frames":0})
 buffers: Dict[str, CallBuffer] = {}
-vads: Dict[str, SimpleVAD] = {}
+vads: Dict[str, ContentVAD] = {}
 
 @sock.route("/media")
 def media_ws(ws):
@@ -224,37 +240,29 @@ def media_ws(ws):
                 call_sid = data.get("start",{}).get("callSid")
                 stream_sid = data.get("start",{}).get("streamSid")
                 buffers[call_sid] = CallBuffer(call_sid)
-                vads[call_sid] = SimpleVAD(VAD_IDLE_MS)
+                vads[call_sid] = ContentVAD(VAD_IDLE_MS)
                 states[call_sid]["frames"]=0
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
             elif ev == "media" and call_sid:
                 payload = data.get("media",{}).get("payload","")
-                if not payload:
-                    continue
+                if not payload: continue
 
-                # --- ここが修正ポイント：on_audio()の前に無音判定 ---
-                vad = vads[call_sid]
-                gap_ms = vad.gap_ms()  # 直前の音からの経過ms（更新前）
-                # 音声バイトをまず追加
                 ulaw = base64.b64decode(payload)
                 buffers[call_sid].append(ulaw)
                 states[call_sid]["frames"] += 1
 
-                # もし十分な長さが溜まっていて、直前が無音ギャップなら「発話区切り」
-                if buffers[call_sid].total_ms() >= MIN_UTTER_MS and gap_ms > VAD_IDLE_MS:
+                # 有声検出：フレーム内容から無音/有声を判定
+                vads[call_sid].on_frame(ulaw, SILENCE_RATIO)
+
+                # 区切り判定：十分溜まっていて無音が続いたら切り出し
+                if buffers[call_sid].total_ms() >= MIN_UTTER_MS and vads[call_sid].is_segment_boundary():
                     wav_path = buffers[call_sid].export_wav()
                     buffers[call_sid].reset()
                     threading.Thread(
-                        target=run_pipeline_and_reply,
-                        args=(call_sid, wav_path),
-                        daemon=True
+                        target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True
                     ).start()
 
-                # 最後に「今 音が来た」ことを記録（次回のギャップ計測用）
-                vad.on_audio()
-
-                # 受信メトリクスのログ
                 if states[call_sid]["frames"] % 50 == 0:
                     log.info(f"[MEDIA] callSid={call_sid} frames={states[call_sid]['frames']}")
 
