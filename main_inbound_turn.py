@@ -1,9 +1,9 @@
 # =========================
 # main_inbound_turn.py
-# One-way: Twilio(Media Streams) -> Whisper -> GPT -> <Say> -> reconnect <Stream>
-# 内容ベースのVAD（μ-law無音判定）で発話区切り
+# Twilio(Media Streams) -> Whisper -> GPT -> <Say> -> reconnect <Stream>
+# VAD: μ-law を PCM16 に復号して RMS/Peak で有声判定
 # =========================
-import os, sys, json, time, base64, wave, uuid, logging, threading
+import os, sys, json, time, base64, wave, uuid, logging, threading, struct
 from typing import Optional, Dict, List
 from flask import Flask, request, Response
 from flask_sock import Sock
@@ -24,9 +24,12 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000
-VAD_IDLE_MS = 900            # 有声→無声のギャップがこの時間を超えたら一区切り
-MIN_UTTER_MS = 700           # 最低発話長（短すぎる断片を防ぐ）
-SILENCE_RATIO = 0.90         # フレーム内の 0xFF 比率がこれ以上なら“無音”とみなす
+
+# ===== VAD parameters (env で調整可) =====
+VAD_IDLE_MS     = int(os.environ.get("VAD_IDLE_MS", "900"))   # 無音継続で区切り
+MIN_UTTER_MS    = int(os.environ.get("MIN_UTTER_MS", "700"))  # 最小発話長
+RMS_THRESH      = float(os.environ.get("RMS_THRESH", "300.0"))# RMSがこれ以上なら有声
+PEAK_THRESH     = int(os.environ.get("PEAK_THRESH", "1200"))  # 絶対値ピークがこれ以上なら有声
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
@@ -72,7 +75,8 @@ def version():
     return Response(json.dumps({
         "app": APP_NAME,
         "ws_url": ws_absolute_url("/media"),
-        "public_base": PUBLIC_BASE
+        "public_base": PUBLIC_BASE,
+        "vad": {"idle_ms": VAD_IDLE_MS, "min_utter_ms": MIN_UTTER_MS, "rms": RMS_THRESH, "peak": PEAK_THRESH}
     }), mimetype="application/json")
 
 
@@ -123,32 +127,39 @@ def ulaw_to_pcm16(ulaw: bytes) -> bytes:
     for b in ulaw: s=ulaw_to_pcm16._t[b]; out+=bytes((s&0xFF,(s>>8)&0xFF))
     return bytes(out)
 
+def pcm16_rms_and_peak(pcm16: bytes) -> (float, int):
+    # little-endian 16bit mono
+    if not pcm16: return 0.0, 0
+    cnt = len(pcm16)//2
+    fmt = "<%dh" % cnt
+    samples = struct.unpack(fmt, pcm16[:cnt*2])
+    peak = max(abs(s) for s in samples)
+    # RMS
+    acc = 0
+    for s in samples: acc += s*s
+    rms = (acc / cnt) ** 0.5
+    return rms, peak
+
 def write_wav_8k_pcm16(pcm16: bytes, path: str):
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm16)
 
 
-# ---------- VAD（内容ベース） ----------
-class ContentVAD:
-    """
-    μ-law 1バイト=1サンプル。0xFF が “デジタルサイレンス” とみなされることが多い。
-    1フレーム内で 0xFF が SILENCE_RATIO 以上なら無音。そうでなければ“有声”。
-    """
-    def __init__(self, idle_ms:int):
+# ---------- VAD（RMS/ピーク） ----------
+class EnergyVAD:
+    def __init__(self, idle_ms:int): 
         self.idle_ms = idle_ms
-        self.last_voiced_ts = time.time()  # 最後に“有声”を検出した時刻
-    def on_frame(self, ulaw: bytes, silence_ratio: float) -> None:
-        if not ulaw:
-            return
-        silent_count = ulaw.count(0xFF)
-        ratio = silent_count / float(len(ulaw))
-        if ratio < silence_ratio:
-            # 有声フレーム
+        self.last_voiced_ts = time.time()
+    def on_frame_pcm16(self, pcm16: bytes):
+        rms, peak = pcm16_rms_and_peak(pcm16)
+        voiced = (rms >= RMS_THRESH) or (peak >= PEAK_THRESH)
+        if voiced:
             self.last_voiced_ts = time.time()
+        return rms, peak, voiced
     def silence_ms(self) -> float:
         return (time.time() - self.last_voiced_ts) * 1000.0
-    def is_segment_boundary(self) -> bool:
+    def boundary(self) -> bool:
         return self.silence_ms() > self.idle_ms
 
 
@@ -160,7 +171,7 @@ class CallBuffer:
     def append(self, b:bytes):
         if b: self.ulaw_chunks.append(b)
     def total_ms(self)->int:
-        return int(sum(len(c) for c in self.ulaw_chunks) / 8)  # ≒ 1,000ms/8,000B
+        return int(sum(len(c) for c in self.ulaw_chunks) / 8)  # ≒1s/8000B
     def reset(self): self.ulaw_chunks.clear()
     def export_wav(self)->Optional[str]:
         if not self.ulaw_chunks: return None
@@ -219,7 +230,7 @@ def _pre_log():
 from collections import defaultdict
 states: Dict[str, Dict[str,int]] = defaultdict(lambda: {"frames":0})
 buffers: Dict[str, CallBuffer] = {}
-vads: Dict[str, ContentVAD] = {}
+vads: Dict[str, EnergyVAD] = {}
 
 @sock.route("/media")
 def media_ws(ws):
@@ -240,7 +251,7 @@ def media_ws(ws):
                 call_sid = data.get("start",{}).get("callSid")
                 stream_sid = data.get("start",{}).get("streamSid")
                 buffers[call_sid] = CallBuffer(call_sid)
-                vads[call_sid] = ContentVAD(VAD_IDLE_MS)
+                vads[call_sid] = EnergyVAD(VAD_IDLE_MS)
                 states[call_sid]["frames"]=0
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
@@ -249,24 +260,30 @@ def media_ws(ws):
                 if not payload: continue
 
                 ulaw = base64.b64decode(payload)
+                pcm16 = ulaw_to_pcm16(ulaw)
+
+                # VAD: 先に有声判定。voiced のときに時刻を更新
+                rms, peak, voiced = vads[call_sid].on_frame_pcm16(pcm16)
+
                 buffers[call_sid].append(ulaw)
                 states[call_sid]["frames"] += 1
 
-                # 有声検出：フレーム内容から無音/有声を判定
-                vads[call_sid].on_frame(ulaw, SILENCE_RATIO)
-
-                # 区切り判定：十分溜まっていて無音が続いたら切り出し
-                if buffers[call_sid].total_ms() >= MIN_UTTER_MS and vads[call_sid].is_segment_boundary():
+                # 区切り条件: 最低長を満たし、直近しばらく"無声"が続いた
+                if buffers[call_sid].total_ms() >= MIN_UTTER_MS and vads[call_sid].boundary():
                     wav_path = buffers[call_sid].export_wav()
                     buffers[call_sid].reset()
-                    threading.Thread(
-                        target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True
-                    ).start()
+                    threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
 
+                # メトリクス出力
                 if states[call_sid]["frames"] % 50 == 0:
-                    log.info(f"[MEDIA] callSid={call_sid} frames={states[call_sid]['frames']}")
+                    log.info(f"[MEDIA] callSid={call_sid} frames={states[call_sid]['frames']} rms={rms:.0f} peak={peak} silence_ms={vads[call_sid].silence_ms():.0f}")
 
             elif ev == "stop":
+                # 残りがあれば最後に処理
+                if call_sid and buffers.get(call_sid) and buffers[call_sid].total_ms() >= 200:
+                    wav_path = buffers[call_sid].export_wav()
+                    buffers[call_sid].reset()
+                    threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
                 log.info(f"[STATUS] stream-stopped callSid={call_sid}")
                 break
 
