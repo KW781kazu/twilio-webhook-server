@@ -1,9 +1,10 @@
 # =========================
 # main_inbound_turn.py
-# Twilio(Media Streams) -> Whisper(ja) -> GPT(履歴) -> <Say(Polly.Mizuki/SSML)> -> reconnect <Stream>
-# 変更点:
-#  - 返答再生中は Media Streams フレームを無視（ミュート）して自己反応を防止
-#  - デバウンスVAD/最小長/連続区切り間隔は維持
+# Twilio(Media Streams) -> Whisper(ja) -> GPT(履歴) -> <Say(Polly.Mizuki + SSMLフラグメント)> -> reconnect <Stream>
+# 修正点:
+#  - <Say> 内は SSMLフラグメントのみ（<speak> は入れない）
+#  - Polly使用時は language 属性を付けない（SSMLが素読みされるのを回避）
+#  - 返答再生中ミュート／デバウンスVAD／最小長／会話メモリは維持
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading, struct, re
 from typing import Optional, Dict, List
@@ -56,10 +57,12 @@ def ws_absolute_url(path:str)->str:
     scheme = "wss" if PUBLIC_BASE.startswith("https://") else "ws"
     return f"{scheme}://{host}{path}"
 
-def to_ssml_ja(text: str) -> str:
+def to_ssml_fragment_ja(text: str) -> str:
+    """<Say> 内に直接入れるSSMLフラグメント（<speak>は付けない）"""
     t = text.strip()
     if len(t) > 140:
         t = t[:140] + "。"
+    # 文区切りで軽いポーズ
     parts = [p for p in re.split(r"[。．！!？?]", t) if p]
     segs=[]
     for i,p in enumerate(parts):
@@ -67,8 +70,7 @@ def to_ssml_ja(text: str) -> str:
         segs.append(f"<s>{p}</s>")
         if i != len(parts)-1:
             segs.append("<break time=\"320ms\"/>")
-    body = "".join(segs) if segs else t
-    return f"<speak xml:lang=\"ja-JP\">{body}</speak>"
+    return "".join(segs) if segs else t
 
 def estimate_play_secs(text: str) -> float:
     # ざっくり日本語 7.5 文字/秒 + 小休止
@@ -76,8 +78,9 @@ def estimate_play_secs(text: str) -> float:
 
 def build_reconnect_twiml(say_text: str) -> str:
     vr = VoiceResponse()
-    ssml = to_ssml_ja(say_text)
-    vr.say(ssml, voice="Polly.Mizuki", language="ja-JP")
+    frag = to_ssml_fragment_ja(say_text)
+    # Polly使用時は language を付けない。SSMLはフラグメントのみ。
+    vr.say(frag, voice="Polly.Mizuki")
     with vr.connect() as c:
         c.stream(
             url=ws_absolute_url("/media"),
@@ -110,9 +113,9 @@ def version():
 # ---------- 初回 TwiML ----------
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
-    vr.say(to_ssml_ja("こんにちは。こちらは受付です。"), voice="Polly.Mizuki", language="ja-JP")
+    vr.say(to_ssml_fragment_ja("こんにちは。こちらは受付です。"), voice="Polly.Mizuki")
     vr.pause(length=1)
-    vr.say(to_ssml_ja("このあとご用件をお話しください。"), voice="Polly.Mizuki", language="ja-JP")
+    vr.say(to_ssml_fragment_ja("このあとご用件をお話しください。"), voice="Polly.Mizuki")
     with vr.connect() as c:
         c.stream(
             url=ws_absolute_url("/media"),
@@ -200,7 +203,7 @@ class DebouncedVAD:
 
 
 # ---------- per-call state ----------
-CALLS: Dict[str, Dict] = {}  # call_sid -> {...}
+CALLS: Dict[str, Dict] = {}
 
 class CallBuffer:
     def __init__(self, call_sid:str):
@@ -251,19 +254,19 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
         log.info(f"[ASR] text='{text}'")
 
         reply="恐れ入ります、もう一度ゆっくりお話しください。"
-        msgs = st["messages"]
+        msgs = st.setdefault("messages", [])
         if text:
             msgs.append({"role":"user","content":text})
-        if oai_client and msgs:
+        if oai_client and msgs is not None:
             try:
                 system_tone = (
                     "あなたは自然で丁寧な日本語の電話受付AIです。返答は1〜2文。"
                     "相手の要望を要約し、必要なら短い質問を1つだけ。オウム返しは最小限。"
                 )
-                if msgs and msgs[0]["role"] == "system":
-                    msgs[0]["content"] = system_tone
-                else:
+                if not msgs or msgs[0].get("role") != "system":
                     msgs.insert(0, {"role":"system","content":system_tone})
+                else:
+                    msgs[0]["content"] = system_tone
                 cr = oai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=msgs,
@@ -276,14 +279,14 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
                 log.warning(f"[NLG] Chat error: {e}")
         log.info(f"[NLG] reply='{reply}'")
 
-        if st["closed"]:
+        if st.get("closed"):
             log.info(f"[TwiML-UPDATE] skipped (call closed) callSid={call_sid}")
             return
 
         twiml = build_reconnect_twiml(reply)
         try:
             twilio_client.calls(call_sid).update(twiml=twiml)
-            # === 再生中は Media を無視するミュート窓を設定 ===
+            # 再生中は Media を無視（自己反応防止）
             mute_secs = estimate_play_secs(reply)
             st["mute_until_ts"] = time.time() + mute_secs
             log.info(f"[TwiML-UPDATE] replied & reconnected (mute {mute_secs:.1f}s) callSid={call_sid}")
@@ -344,9 +347,8 @@ def media_ws(ws):
                 st = CALLS.get(call_sid)
                 if not st: continue
 
-                # === 再生中ミュート: mute_until を超えるまで完全スキップ ===
+                # 再生中ミュート: mute_until を超えるまで完全スキップ
                 if time.time() < float(st.get("mute_until_ts", 0.0)):
-                    # VADをリセット気味にして区切りが出ないよう更新
                     st["vad"].last_voiced_ts = time.time()
                     continue
 
