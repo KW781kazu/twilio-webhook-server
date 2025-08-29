@@ -1,9 +1,9 @@
 # =========================
 # main_inbound_turn.py
-# Twilio(Media Streams) -> Whisper(ja固定) -> GPT(履歴) -> <Say(Polly.Mizuki/SSML)> -> reconnect <Stream>
-# - デバウンスVAD（境界通過のみ発火、最小長、連続区切り間隔）
-# - 発話が長すぎる場合は5秒で強制切り上げ（待ち時間短縮）
-# - TTSはPolly Mizuki + SSMLで自然な間を付与
+# Twilio(Media Streams) -> Whisper(ja) -> GPT(履歴) -> <Say(Polly.Mizuki/SSML)> -> reconnect <Stream>
+# 変更点:
+#  - 返答再生中は Media Streams フレームを無視（ミュート）して自己反応を防止
+#  - デバウンスVAD/最小長/連続区切り間隔は維持
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading, struct, re
 from typing import Optional, Dict, List
@@ -13,7 +13,7 @@ from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client as TwilioClient
 from twilio.base.exceptions import TwilioRestException
 
-# OpenAI (Whisper / GPT)
+# OpenAI
 try:
     from openai import OpenAI
     _openai_enabled = True
@@ -28,13 +28,13 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000
 
-# ===== VAD parameters (env 調整可) =====
-VAD_IDLE_MS   = int(os.environ.get("VAD_IDLE_MS", "1000"))  # 有声→無声の連続がこの時間を超えたら区切り
-MIN_UTTER_MS  = int(os.environ.get("MIN_UTTER_MS", "850"))  # 最小発話長
-BOUND_GAP_MS  = int(os.environ.get("BOUND_GAP_MS", "1200")) # 区切り後しばらく再発火禁止
-RMS_THRESH    = float(os.environ.get("RMS_THRESH", "220.0"))
-PEAK_THRESH   = int(os.environ.get("PEAK_THRESH", "800"))
-MAX_UTTER_MS  = int(os.environ.get("MAX_UTTER_MS", "5000")) # 5秒で強制切り上げ
+# ===== VAD params =====
+VAD_IDLE_MS   = int(os.environ.get("VAD_IDLE_MS", "1100"))
+MIN_UTTER_MS  = int(os.environ.get("MIN_UTTER_MS", "900"))
+BOUND_GAP_MS  = int(os.environ.get("BOUND_GAP_MS", "1400"))
+RMS_THRESH    = float(os.environ.get("RMS_THRESH", "230.0"))
+PEAK_THRESH   = int(os.environ.get("PEAK_THRESH", "850"))
+MAX_UTTER_MS  = int(os.environ.get("MAX_UTTER_MS", "5000"))  # 強制切り上げ
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
@@ -57,27 +57,26 @@ def ws_absolute_url(path:str)->str:
     return f"{scheme}://{host}{path}"
 
 def to_ssml_ja(text: str) -> str:
-    """短文ごとに区切って軽い間を入れるSSMLを作成"""
     t = text.strip()
-    # 長すぎる時は先頭80字に
-    if len(t) > 120:
-        t = t[:120] + "。"
-    # 句点・読点で分割
+    if len(t) > 140:
+        t = t[:140] + "。"
     parts = [p for p in re.split(r"[。．！!？?]", t) if p]
-    ssml_segments = []
-    for i, p in enumerate(parts):
-        # 読点を軽く処理
-        p = p.replace("、", "<break time=\"200ms\"/>")
-        ssml_segments.append(f"<s>{p}</s>")
+    segs=[]
+    for i,p in enumerate(parts):
+        p = p.replace("、", "<break time=\"180ms\"/>")
+        segs.append(f"<s>{p}</s>")
         if i != len(parts)-1:
-            ssml_segments.append("<break time=\"320ms\"/>")
-    body = "".join(ssml_segments) if ssml_segments else t
+            segs.append("<break time=\"320ms\"/>")
+    body = "".join(segs) if segs else t
     return f"<speak xml:lang=\"ja-JP\">{body}</speak>"
+
+def estimate_play_secs(text: str) -> float:
+    # ざっくり日本語 7.5 文字/秒 + 小休止
+    return max(1.6, len(text) / 7.5 + 0.5)
 
 def build_reconnect_twiml(say_text: str) -> str:
     vr = VoiceResponse()
     ssml = to_ssml_ja(say_text)
-    # Polly.Mizuki で自然に話す
     vr.say(ssml, voice="Polly.Mizuki", language="ja-JP")
     with vr.connect() as c:
         c.stream(
@@ -108,7 +107,7 @@ def version():
     }), mimetype="application/json")
 
 
-# ---------- 初回 TwiML（挨拶→Stream） ----------
+# ---------- 初回 TwiML ----------
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
     vr.say(to_ssml_ja("こんにちは。こちらは受付です。"), voice="Polly.Mizuki", language="ja-JP")
@@ -147,7 +146,7 @@ def ms_status():
     return Response("ok", mimetype="text/plain")
 
 
-# ---------- μ-law <-> PCM16 / WAV ----------
+# ---------- μ-law <-> PCM16 ----------
 def ulaw_to_pcm16(ulaw: bytes) -> bytes:
     if not ulaw: return b""
     if not hasattr(ulaw_to_pcm16,"_t"):
@@ -201,7 +200,7 @@ class DebouncedVAD:
 
 
 # ---------- per-call state ----------
-CALLS: Dict[str, Dict] = {}  # call_sid -> {buffer, vad, frames, processing, closed, messages, lock, cond, start_ts}
+CALLS: Dict[str, Dict] = {}  # call_sid -> {...}
 
 class CallBuffer:
     def __init__(self, call_sid:str):
@@ -228,7 +227,7 @@ class CallBuffer:
         return path
 
 
-# ---------- Whisper → GPT → TwiML更新 ----------
+# ---------- Whisper -> GPT -> TwiML ----------
 def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
     st = CALLS.get(call_sid)
     if not st: return
@@ -251,21 +250,28 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
                 log.warning(f"[ASR] Whisper error: {e}")
         log.info(f"[ASR] text='{text}'")
 
-        # --- GPT with conversation memory ---
         reply="恐れ入ります、もう一度ゆっくりお話しください。"
-        st_msgs = st["messages"]
+        msgs = st["messages"]
         if text:
-            st_msgs.append({"role":"user","content":text})
-        if oai_client and st_msgs:
+            msgs.append({"role":"user","content":text})
+        if oai_client and msgs:
             try:
+                system_tone = (
+                    "あなたは自然で丁寧な日本語の電話受付AIです。返答は1〜2文。"
+                    "相手の要望を要約し、必要なら短い質問を1つだけ。オウム返しは最小限。"
+                )
+                if msgs and msgs[0]["role"] == "system":
+                    msgs[0]["content"] = system_tone
+                else:
+                    msgs.insert(0, {"role":"system","content":system_tone})
                 cr = oai_client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=st_msgs,
+                    messages=msgs,
                     temperature=0.3,
                     max_tokens=120,
                 )
                 reply = cr.choices[0].message.content.strip()
-                st_msgs.append({"role":"assistant","content":reply})
+                msgs.append({"role":"assistant","content":reply})
             except Exception as e:
                 log.warning(f"[NLG] Chat error: {e}")
         log.info(f"[NLG] reply='{reply}'")
@@ -277,15 +283,17 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
         twiml = build_reconnect_twiml(reply)
         try:
             twilio_client.calls(call_sid).update(twiml=twiml)
-            log.info(f"[TwiML-UPDATE] replied and reconnected stream for callSid={call_sid}")
+            # === 再生中は Media を無視するミュート窓を設定 ===
+            mute_secs = estimate_play_secs(reply)
+            st["mute_until_ts"] = time.time() + mute_secs
+            log.info(f"[TwiML-UPDATE] replied & reconnected (mute {mute_secs:.1f}s) callSid={call_sid}")
         except TwilioRestException as e:
             log.warning(f"[Twilio UPDATE] failed: {e.msg} (status={e.status})")
 
     finally:
         try:
             if wav_path and os.path.exists(wav_path): os.remove(wav_path)
-        except Exception:
-            pass
+        except Exception: pass
         with st["lock"]:
             st["processing"] = False
         with st["cond"]:
@@ -325,24 +333,25 @@ def media_ws(ws):
                     "frames": 0,
                     "processing": False,
                     "closed": False,
-                    "messages": [
-                        {"role":"system","content":
-                         "あなたは丁寧で自然な日本語の電話受付AIです。返答は1〜2文。言い切りで簡潔に。"
-                         "必要なときだけ短い質問を1つだけ返して会話を前に進めてください。"
-                         "専門用語はやさしく言い換え、相づちは最小限に。"},
-                    ],
+                    "messages": [],
                     "lock": threading.Lock(),
                     "cond": threading.Condition(),
-                    "start_ts": time.time(),
+                    "mute_until_ts": 0.0,
                 }
                 log.info(f"[STATUS] stream-started callSid={call_sid} streamSid={stream_sid}")
 
             elif ev == "media" and call_sid:
-                st = CALLS.get(call_sid); 
+                st = CALLS.get(call_sid)
                 if not st: continue
+
+                # === 再生中ミュート: mute_until を超えるまで完全スキップ ===
+                if time.time() < float(st.get("mute_until_ts", 0.0)):
+                    # VADをリセット気味にして区切りが出ないよう更新
+                    st["vad"].last_voiced_ts = time.time()
+                    continue
+
                 payload = data.get("media",{}).get("payload","")
                 if not payload: continue
-
                 ulaw = base64.b64decode(payload)
                 pcm16 = ulaw_to_pcm16(ulaw)
 
@@ -351,10 +360,8 @@ def media_ws(ws):
                 st["buffer"].append(ulaw)
                 st["frames"] += 1
 
-                # 長すぎる場合は強制締め
                 long_enough = st["buffer"].elapsed_ms() >= MAX_UTTER_MS
 
-                # 境界通過 or 長すぎ → 最小長を満たしていれば切り出し
                 if (boundary or long_enough) and st["buffer"].total_ms() >= MIN_UTTER_MS and not st["processing"]:
                     wav_path = st["buffer"].export_wav()
                     st["buffer"].reset()
