@@ -1,10 +1,9 @@
 # =========================
 # main_inbound_turn.py
-# Twilio(Media Streams) -> Whisper(ja) -> GPT(履歴) -> <Say(Polly.Mizuki/テキストのみ)> -> reconnect <Stream>
-# 変更点:
-#  - SSMLを完全に廃止（タグ素読み問題を回避）
-#  - 再生中ミュートを強化（min 1.8s + 文字数から加算）
-#  - 会話プロンプトを短文寄りに調整
+# Twilio(Media Streams) -> Whisper(ja) -> GPT -> TwiML <Say(Polly.Mizuki)> -> reconnect <Stream>
+# 改善:
+#  - レイテンシ短縮: VAD閾値/ギャップ/ミュート時間を調整（デフォ攻め）
+#  - 任意SSML: TTS_USE_SSML=1 のとき <prosody> と <break> だけ使う（<speak>は使わない）
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading, struct, re
 from typing import Optional, Dict, List
@@ -29,13 +28,15 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000
 
-# ===== VAD params =====
-VAD_IDLE_MS   = int(os.environ.get("VAD_IDLE_MS", "1100"))
-MIN_UTTER_MS  = int(os.environ.get("MIN_UTTER_MS", "900"))
-BOUND_GAP_MS  = int(os.environ.get("BOUND_GAP_MS", "1400"))
-RMS_THRESH    = float(os.environ.get("RMS_THRESH", "230.0"))
-PEAK_THRESH   = int(os.environ.get("PEAK_THRESH", "850"))
-MAX_UTTER_MS  = int(os.environ.get("MAX_UTTER_MS", "5000"))
+# ====== 可変パラメータ（環境変数で上書き可） ======
+VAD_IDLE_MS   = int(os.environ.get("VAD_IDLE_MS", "850"))   # 以前:1100
+MIN_UTTER_MS  = int(os.environ.get("MIN_UTTER_MS", "700"))  # 以前:900
+BOUND_GAP_MS  = int(os.environ.get("BOUND_GAP_MS", "950"))  # 以前:1400
+RMS_THRESH    = float(os.environ.get("RMS_THRESH", "210.0"))
+PEAK_THRESH   = int(os.environ.get("PEAK_THRESH", "700"))
+MAX_UTTER_MS  = int(os.environ.get("MAX_UTTER_MS", "4500"))
+
+TTS_USE_SSML  = os.environ.get("TTS_USE_SSML", "0") == "1"
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
@@ -57,14 +58,29 @@ def ws_absolute_url(path:str)->str:
     scheme = "wss" if PUBLIC_BASE.startswith("https://") else "ws"
     return f"{scheme}://{host}{path}"
 
+def _shape_text_for_tts(text: str) -> str:
+    t = (text or "").strip()
+    # 冗長防止
+    if len(t) > 140: t = t[:140] + "。"
+    if not TTS_USE_SSML:
+        # 句読点を少し増やして自然さ補助（SSML無効時）
+        t = re.sub(r"([ですますでしょう])(?=[^。！？]*$)", r"\1。", t)
+        return t
+    # --- SSML(フラグメントのみ) ---
+    # 軽くピッチを+2%、テンポはmedium、読点で短いポーズ
+    body = t.replace("、", "<break time=\"140ms\"/>")
+    return f"<prosody rate=\"medium\" pitch=\"+2%\">{body}</prosody>"
+
 def estimate_play_secs(text: str) -> float:
-    # 日本語ざっくり 7.5文字/秒 + 最低1.8秒のミュート
-    return max(1.8, len(text) / 7.5 + 0.4)
+    # ざっくり 9.0 文字/秒 として見積（前より短め）、最小 1.25s
+    chars = max(1, len((text or "").strip()))
+    return max(1.25, chars / 9.0 + 0.25)
 
 def build_reconnect_twiml(say_text: str) -> str:
     vr = VoiceResponse()
-    # SSMLタグは使わず、句読点だけで間を作る
-    vr.say(say_text, voice="Polly.Mizuki")
+    frag_or_text = _shape_text_for_tts(say_text)
+    # Polly使用時は language 属性は付けない
+    vr.say(frag_or_text, voice="Polly.Mizuki")
     with vr.connect() as c:
         c.stream(
             url=ws_absolute_url("/media"),
@@ -90,16 +106,17 @@ def version():
             "idle_ms": VAD_IDLE_MS, "min_utter_ms": MIN_UTTER_MS,
             "bound_gap_ms": BOUND_GAP_MS, "rms": RMS_THRESH,
             "peak": PEAK_THRESH, "max_utter_ms": MAX_UTTER_MS
-        }
+        },
+        "tts_use_ssml": TTS_USE_SSML
     }), mimetype="application/json")
 
 
 # ---------- 初回 TwiML ----------
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
-    vr.say("こんにちは。こちらは受付です。", voice="Polly.Mizuki")
+    vr.say(_shape_text_for_tts("こんにちは。こちらは受付です。"), voice="Polly.Mizuki")
     vr.pause(length=1)
-    vr.say("このあとご用件をお話しください。", voice="Polly.Mizuki")
+    vr.say(_shape_text_for_tts("このあと、ご用件をお話しください。"), voice="Polly.Mizuki")
     with vr.connect() as c:
         c.stream(
             url=ws_absolute_url("/media"),
@@ -245,7 +262,7 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
             try:
                 system_tone = (
                     "あなたは自然で丁寧な日本語の電話受付AIです。返答は1〜2文。"
-                    "要点をまとめ、必要なら短い質問を1つだけ。長文は避けてください。"
+                    "要点をまとめ、必要なら短い質問を1つだけ。言い切りで短く。"
                 )
                 if not msgs or msgs[0].get("role") != "system":
                     msgs.insert(0, {"role":"system","content":system_tone})
@@ -255,7 +272,7 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
                     model="gpt-4o-mini",
                     messages=msgs,
                     temperature=0.3,
-                    max_tokens=110,
+                    max_tokens=105,
                 )
                 reply = cr.choices[0].message.content.strip()
                 msgs.append({"role":"assistant","content":reply})
@@ -330,7 +347,7 @@ def media_ws(ws):
                 st = CALLS.get(call_sid)
                 if not st: continue
 
-                # 再生中ミュート
+                # 再生中ミュート（自己反応防止）
                 if time.time() < float(st.get("mute_until_ts", 0.0)):
                     st["vad"].last_voiced_ts = time.time()
                     continue
@@ -376,4 +393,3 @@ def media_ws(ws):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")), debug=False)
-
