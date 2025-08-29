@@ -128,9 +128,12 @@ def write_wav_8k_pcm16(pcm16: bytes, path: str):
 
 # ---------- 簡易VAD ----------
 class SimpleVAD:
-    def __init__(self, idle_ms:int): self.idle_ms=idle_ms; self.last_ts=time.time()
+    def __init__(self, idle_ms:int):
+        self.idle_ms=idle_ms
+        self.last_ts=time.time()
     def on_audio(self): self.last_ts=time.time()
-    def is_end(self)->bool: return (time.time()-self.last_ts)*1000.0 > self.idle_ms
+    def gap_ms(self)->float: return (time.time()-self.last_ts)*1000.0
+    def is_end(self)->bool: return self.gap_ms() > self.idle_ms
 
 
 # ---------- バッファ ----------
@@ -227,18 +230,33 @@ def media_ws(ws):
 
             elif ev == "media" and call_sid:
                 payload = data.get("media",{}).get("payload","")
-                if payload:
-                    ulaw = base64.b64decode(payload)
-                    buffers[call_sid].append(ulaw)
-                    vads[call_sid].on_audio()
-                    s = states[call_sid]; s["frames"] += 1
-                    if s["frames"] % 50 == 0:
-                        log.info(f"[MEDIA] callSid={call_sid} frames={s['frames']}")
+                if not payload:
+                    continue
 
-                    if buffers[call_sid].total_ms() >= MIN_UTTER_MS and vads[call_sid].is_end():
-                        wav_path = buffers[call_sid].export_wav()
-                        buffers[call_sid].reset()
-                        threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
+                # --- ここが修正ポイント：on_audio()の前に無音判定 ---
+                vad = vads[call_sid]
+                gap_ms = vad.gap_ms()  # 直前の音からの経過ms（更新前）
+                # 音声バイトをまず追加
+                ulaw = base64.b64decode(payload)
+                buffers[call_sid].append(ulaw)
+                states[call_sid]["frames"] += 1
+
+                # もし十分な長さが溜まっていて、直前が無音ギャップなら「発話区切り」
+                if buffers[call_sid].total_ms() >= MIN_UTTER_MS and gap_ms > VAD_IDLE_MS:
+                    wav_path = buffers[call_sid].export_wav()
+                    buffers[call_sid].reset()
+                    threading.Thread(
+                        target=run_pipeline_and_reply,
+                        args=(call_sid, wav_path),
+                        daemon=True
+                    ).start()
+
+                # 最後に「今 音が来た」ことを記録（次回のギャップ計測用）
+                vad.on_audio()
+
+                # 受信メトリクスのログ
+                if states[call_sid]["frames"] % 50 == 0:
+                    log.info(f"[MEDIA] callSid={call_sid} frames={states[call_sid]['frames']}")
 
             elif ev == "stop":
                 log.info(f"[STATUS] stream-stopped callSid={call_sid}")
