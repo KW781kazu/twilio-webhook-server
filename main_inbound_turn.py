@@ -1,10 +1,11 @@
 # =========================
 # main_inbound_turn.py
-# Twilio(Media Streams) -> Whisper -> GPT -> <Say> -> reconnect <Stream>
-# 改良点:
-#  - 通話ごとに逐次実行（同時リダイレクト禁止: Twilio 21220/400 対策）
-#  - 通話終了フラグで stop 後の更新を防止
-#  - VAD をエネルギー(RMS/Peak)ベースで安定化 & しきい値緩和
+# Twilio(Media Streams) -> Whisper(ja固定) -> GPT(履歴あり) -> <Say> -> reconnect <Stream>
+# 改良点：
+#  - VADにデバウンス/連打防止（境界通過のみ発火・最小長チェック・連続区切り間隔）
+#  - Whisper language="ja"
+#  - 会話履歴を call_sid ごとに保持
+#  - TwiML更新は逐次＆stop後はスキップ
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading, struct
 from typing import Optional, Dict, List
@@ -30,12 +31,13 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 SAMPLE_RATE = 8000
 
 # ===== VAD parameters (env で調整可) =====
-VAD_IDLE_MS     = int(os.environ.get("VAD_IDLE_MS", "1200"))  # 無音継続で区切り(少し長め)
-MIN_UTTER_MS    = int(os.environ.get("MIN_UTTER_MS", "1000")) # 最小発話長(短文でも1秒確保)
-RMS_THRESH      = float(os.environ.get("RMS_THRESH", "250.0"))# RMSがこれ以上なら有声
-PEAK_THRESH     = int(os.environ.get("PEAK_THRESH", "900"))   # 絶対値ピークがこれ以上なら有声
+VAD_IDLE_MS     = int(os.environ.get("VAD_IDLE_MS", "1100"))  # 有声→無声の連続がこの時間を超えたら区切り
+MIN_UTTER_MS    = int(os.environ.get("MIN_UTTER_MS", "900"))  # 最小発話長
+BOUND_GAP_MS    = int(os.environ.get("BOUND_GAP_MS", "1200")) # 区切り後しばらく再発火禁止
+RMS_THRESH      = float(os.environ.get("RMS_THRESH", "230.0"))
+PEAK_THRESH     = int(os.environ.get("PEAK_THRESH", "850"))
 
-logging.basicConfig(level=os.environ.get("LOG_LEVEL"," INFO").strip(),
+logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
 log = logging.getLogger(APP_NAME)
 
@@ -80,7 +82,10 @@ def version():
         "app": APP_NAME,
         "ws_url": ws_absolute_url("/media"),
         "public_base": PUBLIC_BASE,
-        "vad": {"idle_ms": VAD_IDLE_MS, "min_utter_ms": MIN_UTTER_MS, "rms": RMS_THRESH, "peak": PEAK_THRESH}
+        "vad": {
+            "idle_ms": VAD_IDLE_MS, "min_utter_ms": MIN_UTTER_MS,
+            "bound_gap_ms": BOUND_GAP_MS, "rms": RMS_THRESH, "peak": PEAK_THRESH
+        }
     }), mimetype="application/json")
 
 
@@ -114,14 +119,12 @@ def ms_status():
     stream_sid = payload.get("StreamSid") or payload.get("streamSid")
     reason = payload.get("Reason") or payload.get("StopReason")
     log.info(f"[MS-STATUS] event={event} callSid={call_sid} streamSid={stream_sid} reason={reason} raw={dict(payload)}")
-    # stop が来たら通話終了フラグを建てる
     if call_sid and event in ("stream-stopped", "end", "stop"):
         st = CALLS.get(call_sid)
-        if st: 
+        if st:
             st["closed"] = True
-            st["cond"].acquire()
-            st["cond"].notify_all()
-            st["cond"].release()
+            with st["cond"]:
+                st["cond"].notify_all()
     return Response("ok", mimetype="text/plain")
 
 
@@ -157,25 +160,35 @@ def write_wav_8k_pcm16(pcm16: bytes, path: str):
         wf.writeframes(pcm16)
 
 
-# ---------- VAD（RMS/ピーク） ----------
-class EnergyVAD:
-    def __init__(self, idle_ms:int): 
+# ---------- VAD（デバウンス） ----------
+class DebouncedVAD:
+    """
+    フレームごとにRMS/Peakで有声判定。
+    - 直近の「有声」からの無音継続時間 > VAD_IDLE_MS になった瞬間だけ True を返す（境界通過）
+    - 直近の区切りから BOUND_GAP_MS 経過するまで再発火しない
+    """
+    def __init__(self, idle_ms:int, gap_ms:int):
         self.idle_ms = idle_ms
+        self.gap_ms  = gap_ms
         self.last_voiced_ts = time.time()
+        self.last_boundary_ts = 0.0
+
     def on_frame_pcm16(self, pcm16: bytes):
         rms, peak = pcm16_rms_and_peak(pcm16)
         voiced = (rms >= RMS_THRESH) or (peak >= PEAK_THRESH)
-        if voiced: self.last_voiced_ts = time.time()
-        return rms, peak, voiced
-    def silence_ms(self) -> float:
-        return (time.time() - self.last_voiced_ts) * 1000.0
-    def boundary(self) -> bool:
-        return self.silence_ms() > self.idle_ms
+        now = time.time()
+        if voiced:
+            self.last_voiced_ts = now
+        silence_ms = (now - self.last_voiced_ts) * 1000.0
+        boundary = False
+        if silence_ms > self.idle_ms and (now - self.last_boundary_ts) * 1000.0 > self.gap_ms:
+            boundary = True
+            self.last_boundary_ts = now
+        return rms, peak, voiced, silence_ms, boundary
 
 
-# ---------- per-call state (逐次実行制御) ----------
-from collections import defaultdict
-CALLS: Dict[str, Dict] = {}  # call_sid -> {buffer, vad, frames, processing, closed, lock, cond}
+# ---------- per-call state ----------
+CALLS: Dict[str, Dict] = {}  # call_sid -> {buffer, vad, frames, processing, closed, messages, lock, cond}
 
 class CallBuffer:
     def __init__(self, call_sid:str):
@@ -194,11 +207,11 @@ class CallBuffer:
         return path
 
 
-# ---------- Whisper → GPT → TwiML更新（逐次・安全） ----------
+# ---------- Whisper → GPT → TwiML更新 ----------
 def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
     st = CALLS.get(call_sid)
     if not st: return
-    # 逐次制御：二重起動防止
+
     with st["lock"]:
         if st["processing"] or st["closed"]:
             return
@@ -209,29 +222,32 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
         if wav_path and oai_client:
             try:
                 with open(wav_path,"rb") as f:
-                    tr = oai_client.audio.transcriptions.create(model="whisper-1", file=f)
+                    tr = oai_client.audio.transcriptions.create(
+                        model="whisper-1", file=f, language="ja"
+                    )
                 text = (tr.text or "").strip()
             except Exception as e:
                 log.warning(f"[ASR] Whisper error: {e}")
         log.info(f"[ASR] text='{text}'")
 
+        # --- GPT with conversation memory ---
         reply="恐れ入ります、もう一度ゆっくりお話しください。"
-        if text and oai_client:
+        st_msgs = st["messages"]
+        if text:
+            st_msgs.append({"role":"user","content":text})
+        if oai_client and st_msgs:
             try:
                 cr = oai_client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[
-                        {"role":"system","content":"あなたは丁寧な日本語の電話受付AIです。簡潔に1〜2文で答えてください。"},
-                        {"role":"user","content":text},
-                    ],
+                    messages=st_msgs,
                     temperature=0.4,
                 )
                 reply = cr.choices[0].message.content.strip()
+                st_msgs.append({"role":"assistant","content":reply})
             except Exception as e:
                 log.warning(f"[NLG] Chat error: {e}")
         log.info(f"[NLG] reply='{reply}'")
 
-        # stop後は更新しない
         if st["closed"]:
             log.info(f"[TwiML-UPDATE] skipped (call closed) callSid={call_sid}")
             return
@@ -241,21 +257,17 @@ def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
             twilio_client.calls(call_sid).update(twiml=twiml)
             log.info(f"[TwiML-UPDATE] replied and reconnected stream for callSid={call_sid}")
         except TwilioRestException as e:
-            # 21220 (Concurrent), 20003/21215等は記録のみ
             log.warning(f"[Twilio UPDATE] failed: {e.msg} (status={e.status})")
 
     finally:
-        # クリーンアップ
         try:
             if wav_path and os.path.exists(wav_path): os.remove(wav_path)
         except Exception:
             pass
         with st["lock"]:
             st["processing"] = False
-        # 次の発話を待つスレッドに通知
-        st["cond"].acquire()
-        st["cond"].notify_all()
-        st["cond"].release()
+        with st["cond"]:
+            st["cond"].notify_all()
 
 
 # ---------- 事前ログ ----------
@@ -285,13 +297,15 @@ def media_ws(ws):
             if ev == "start":
                 call_sid = data.get("start",{}).get("callSid")
                 stream_sid = data.get("start",{}).get("streamSid")
-
                 CALLS[call_sid] = {
                     "buffer": CallBuffer(call_sid),
-                    "vad":    EnergyVAD(VAD_IDLE_MS),
+                    "vad":    DebouncedVAD(VAD_IDLE_MS, BOUND_GAP_MS),
                     "frames": 0,
                     "processing": False,
                     "closed": False,
+                    "messages": [
+                        {"role":"system","content":"あなたは丁寧で簡潔な日本語の電話受付AIです。相手の意図を確認し、必要なら追加の短い質問を1つ返してください。"},
+                    ],
                     "lock": threading.Lock(),
                     "cond": threading.Condition(),
                 }
@@ -306,26 +320,26 @@ def media_ws(ws):
                 ulaw = base64.b64decode(payload)
                 pcm16 = ulaw_to_pcm16(ulaw)
 
-                rms, peak, _ = st["vad"].on_frame_pcm16(pcm16)
+                rms, peak, voiced, silence_ms, boundary = st["vad"].on_frame_pcm16(pcm16)
 
                 st["buffer"].append(ulaw)
                 st["frames"] += 1
 
-                # 区切り: 最低長 + 無音持続
-                if st["buffer"].total_ms() >= MIN_UTTER_MS and st["vad"].boundary() and not st["processing"]:
+                # 境界通過かつ 最小長 条件で切り出し（逐次・連打防止）
+                if boundary and st["buffer"].total_ms() >= MIN_UTTER_MS and not st["processing"]:
                     wav_path = st["buffer"].export_wav()
                     st["buffer"].reset()
                     threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
 
                 if st["frames"] % 50 == 0:
-                    log.info(f"[MEDIA] callSid={call_sid} frames={st['frames']} rms={rms:.0f} peak={peak} silence_ms={st['vad'].silence_ms():.0f}")
+                    log.info(f"[MEDIA] callSid={call_sid} frames={st['frames']} rms={rms:.0f} peak={peak} silence_ms={silence_ms:.0f} voiced={voiced}")
 
             elif ev == "stop":
                 st = CALLS.get(call_sid)
                 if st:
                     st["closed"] = True
-                    # 残りがあって処理中でなければ最後に1回だけ処理
-                    if st["buffer"].total_ms() >= 300 and not st["processing"]:
+                    # 最後の残りを1回だけ（任意）
+                    if st["buffer"].total_ms() >= 500 and not st["processing"]:
                         wav_path = st["buffer"].export_wav()
                         st["buffer"].reset()
                         threading.Thread(target=run_pipeline_and_reply, args=(call_sid, wav_path), daemon=True).start()
