@@ -1,5 +1,5 @@
 # =========================
-# main_inbound_turn.py  (eventlet + flask-sock / TwiML attr fixed)
+# main_inbound_turn.py  (one-way pipeline: Whisper -> GPT -> Say -> reconnect Stream)
 # =========================
 import os, sys, json, time, base64, wave, uuid, logging, threading
 from typing import Optional, Dict, List
@@ -22,10 +22,10 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 SAMPLE_RATE = 8000
-VAD_IDLE_MS = 1000
-MIN_UTTER_MS = 800
+VAD_IDLE_MS = 1000           # 無音1sで区切り
+MIN_UTTER_MS = 800           # 0.8s以上で処理
 
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
 log = logging.getLogger(APP_NAME)
 
@@ -36,13 +36,28 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 oai_client = OpenAI(api_key=OPENAI_API_KEY) if (_openai_enabled and OPENAI_API_KEY) else None
 
 
-def xml_response(x: str) -> Response:
+# ---------- helpers ----------
+def xml_response(x:str)->Response:
     return Response(x, mimetype="text/xml; charset=utf-8")
 
-def ws_absolute_url(path: str) -> str:
-    host = PUBLIC_BASE.replace("https://", "").replace("http://", "")
+def ws_absolute_url(path:str)->str:
+    host = PUBLIC_BASE.replace("https://","").replace("http://","")
     scheme = "wss" if PUBLIC_BASE.startswith("https://") else "ws"
     return f"{scheme}://{host}{path}"
+
+def build_reconnect_twiml(say_text: str) -> str:
+    vr = VoiceResponse()
+    if say_text.strip():
+        vr.say(say_text, language="ja-JP")
+    with vr.connect() as c:
+        c.stream(
+            url=ws_absolute_url("/media"),
+            track="inbound_track",
+            status_callback=f"{PUBLIC_BASE}/ms-status",
+            status_callback_method="POST",
+            status_callback_event="start end"   # ← 正しい属性名（単数）
+        )
+    return str(vr)
 
 
 # ---------- health/version ----------
@@ -58,11 +73,11 @@ def version():
     }), mimetype="application/json")
 
 
-# ---------- TwiML（挨拶→Stream） ----------
+# ---------- 初回 TwiML（挨拶→Stream） ----------
 def build_initial_twiml() -> str:
     vr = VoiceResponse()
     vr.say("こんにちは。こちらは受付です。", language="ja-JP")
-    vr.pause(length=1)
+    vr.pause(length=1)  # ビープ代わりのポーズ
     vr.say("このあとご用件をお話しください。", language="ja-JP")
     with vr.connect() as c:
         c.stream(
@@ -70,21 +85,19 @@ def build_initial_twiml() -> str:
             track="inbound_track",
             status_callback=f"{PUBLIC_BASE}/ms-status",
             status_callback_method="POST",
-            # ※ 正：statusCallbackEvent（単数）にスペース区切りで列挙
             status_callback_event="start end"
         )
     log.info(f"[TwiML] stream url -> {ws_absolute_url('/media')}")
     return str(vr)
 
-@app.route("/voice", methods=["GET", "POST"])
+@app.route("/voice", methods=["GET","POST"])
 def voice(): return xml_response(build_initial_twiml())
 
 
-# ---------- Media Streams status callback ----------
+# ---------- Media Streams status callback（理由をログに出す） ----------
 @app.route("/ms-status", methods=["POST"])
 def ms_status():
     payload = request.form or request.json or {}
-    # Twilio からは StreamEvent または StatusCallbackEvent が来る
     event = payload.get("StreamEvent") or payload.get("StatusCallbackEvent") or "unknown"
     call_sid = payload.get("CallSid") or payload.get("callSid")
     stream_sid = payload.get("StreamSid") or payload.get("streamSid")
@@ -93,10 +106,10 @@ def ms_status():
     return Response("ok", mimetype="text/plain")
 
 
-# ---------- μ-law -> PCM16 ----------
+# ---------- μ-law -> PCM16 / WAV ----------
 def ulaw_to_pcm16(ulaw: bytes) -> bytes:
     if not ulaw: return b""
-    if not hasattr(ulaw_to_pcm16, "_t"):
+    if not hasattr(ulaw_to_pcm16,"_t"):
         t=[]
         for i in range(256):
             u=~i & 0xFF; sign=u&0x80; exp=(u>>4)&7; man=u&0x0F
@@ -108,7 +121,6 @@ def ulaw_to_pcm16(ulaw: bytes) -> bytes:
     return bytes(out)
 
 def write_wav_8k_pcm16(pcm16: bytes, path: str):
-    import wave
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm16)
@@ -116,24 +128,22 @@ def write_wav_8k_pcm16(pcm16: bytes, path: str):
 
 # ---------- 簡易VAD ----------
 class SimpleVAD:
-    def __init__(self, idle_ms: int):
-        self.idle_ms = idle_ms
-        self.last_ts = time.time()
-    def on_audio(self): self.last_ts = time.time()
-    def is_end(self) -> bool: return (time.time()-self.last_ts)*1000.0 > self.idle_ms
+    def __init__(self, idle_ms:int): self.idle_ms=idle_ms; self.last_ts=time.time()
+    def on_audio(self): self.last_ts=time.time()
+    def is_end(self)->bool: return (time.time()-self.last_ts)*1000.0 > self.idle_ms
 
 
 # ---------- バッファ ----------
 class CallBuffer:
-    def __init__(self, call_sid: str):
-        self.call_sid = call_sid
-        self.ulaw_chunks: List[bytes] = []
-    def append(self, b: bytes):
+    def __init__(self, call_sid:str):
+        self.call_sid=call_sid
+        self.ulaw_chunks: List[bytes]=[]
+    def append(self, b:bytes):
         if b: self.ulaw_chunks.append(b)
-    def total_ms(self) -> int:
-        return int(sum(len(c) for c in self.ulaw_chunks) / 8)
+    def total_ms(self)->int:
+        return int(sum(len(c) for c in self.ulaw_chunks) / 8)  # 8000B ≒ 1s
     def reset(self): self.ulaw_chunks.clear()
-    def export_wav(self) -> Optional[str]:
+    def export_wav(self)->Optional[str]:
         if not self.ulaw_chunks: return None
         pcm16 = ulaw_to_pcm16(b"".join(self.ulaw_chunks))
         path = f"/tmp/{self.call_sid}_{uuid.uuid4().hex}.wav"
@@ -141,38 +151,22 @@ class CallBuffer:
         return path
 
 
-# ---------- 応答（Whisper→GPT→TwiML更新） ----------
-def build_reconnect_twiml(say_text: str) -> str:
-    vr = VoiceResponse()
-    if say_text.strip():
-        vr.say(say_text, language="ja-JP")
-    with vr.connect() as c:
-        c.stream(
-            url=ws_absolute_url("/media"),
-            track="inbound_track",
-            status_callback=f"{PUBLIC_BASE}/ms-status",
-            status_callback_method="POST",
-            status_callback_event="start end"
-        )
-    return str(vr)
-
-def run_pipeline_and_reply(call_sid: str, wav_path: Optional[str]):
-    text = ""
-    if wav_path and _openai_enabled and OPENAI_API_KEY:
+# ---------- Whisper → GPT → TwiML更新 ----------
+def run_pipeline_and_reply(call_sid:str, wav_path:Optional[str]):
+    text=""
+    if wav_path and oai_client:
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            with open(wav_path, "rb") as f:
-                tr = client.audio.transcriptions.create(model="whisper-1", file=f)
+            with open(wav_path,"rb") as f:
+                tr = oai_client.audio.transcriptions.create(model="whisper-1", file=f)
             text = (tr.text or "").strip()
         except Exception as e:
             log.warning(f"[ASR] Whisper error: {e}")
     log.info(f"[ASR] text='{text}'")
 
-    reply = "恐れ入ります、もう一度ゆっくりお話しください。"
-    if text and _openai_enabled and OPENAI_API_KEY:
+    reply="恐れ入ります、もう一度ゆっくりお話しください。"
+    if text and oai_client:
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            cr = client.chat.completions.create(
+            cr = oai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role":"system","content":"あなたは丁寧な日本語の電話受付AIです。簡潔に1〜2文で答えてください。"},
@@ -188,6 +182,7 @@ def run_pipeline_and_reply(call_sid: str, wav_path: Optional[str]):
     twiml = build_reconnect_twiml(reply)
     twilio_client.calls(call_sid).update(twiml=twiml)
     log.info(f"[TwiML-UPDATE] replied and reconnected stream for callSid={call_sid}")
+
     try:
         if wav_path and os.path.exists(wav_path): os.remove(wav_path)
     except Exception: pass
@@ -216,7 +211,6 @@ def media_ws(ws):
             raw = ws.receive()
             if raw is None:
                 log.info("[WS] client closed"); break
-
             try:
                 data = json.loads(raw)
             except Exception:
